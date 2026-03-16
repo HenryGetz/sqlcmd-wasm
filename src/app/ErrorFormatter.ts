@@ -41,6 +41,28 @@ export class ErrorFormatter {
   }
 
   private mapTranspileFailure(failure: BatchExecutionFailure): SqlServerStyleError {
+    if (/no executable sql was generated/i.test(failure.rawError)) {
+      return {
+        errorCode: 50000,
+        level: 16,
+        state: 1,
+        serverName: this.serverName,
+        lineNumber: this.normalizeLineNumber(failure.lineNumber),
+        message: failure.rawError,
+      };
+    }
+
+    if (/unsupported|not supported|cannot transpile/i.test(failure.rawError)) {
+      return {
+        errorCode: 50000,
+        level: 16,
+        state: 1,
+        serverName: this.serverName,
+        lineNumber: this.normalizeLineNumber(failure.lineNumber),
+        message: failure.rawError,
+      };
+    }
+
     const token = failure.token?.trim();
 
     return {
@@ -49,12 +71,7 @@ export class ErrorFormatter {
       state: 1,
       serverName: this.serverName,
       lineNumber: this.normalizeLineNumber(failure.lineNumber),
-      message:
-        token && token.length > 0
-          ? `Incorrect syntax near '${token}'.`
-          : this.isPlainSyntaxFallback(failure.rawError)
-            ? 'Incorrect syntax.'
-            : 'Incorrect syntax.',
+      message: token && token.length > 0 ? `Incorrect syntax near '${token}'.` : 'Incorrect syntax.',
     };
   }
 
@@ -86,6 +103,49 @@ export class ErrorFormatter {
         serverName: this.serverName,
         lineNumber: this.normalizeLineNumber(failure.lineNumber),
         message: `Invalid column name '${columnName}'.`,
+      };
+    }
+
+    const notNullConstraintMatch = raw.match(/NOT NULL constraint failed:\s*([^\n]+)/i);
+    if (notNullConstraintMatch) {
+      const columnPath = this.sanitizeIdentifier(notNullConstraintMatch[1]);
+      const columnName = columnPath.includes('.')
+        ? columnPath.slice(columnPath.lastIndexOf('.') + 1)
+        : columnPath;
+
+      return {
+        errorCode: 515,
+        level: 16,
+        state: 2,
+        serverName: this.serverName,
+        lineNumber: this.normalizeLineNumber(failure.lineNumber),
+        message: `Cannot insert the value NULL into column '${columnName}'; column does not allow nulls.`,
+      };
+    }
+
+    const alreadyExistsMatch = raw.match(/table\s+([^\s]+)\s+already exists/i);
+    if (alreadyExistsMatch) {
+      const objectName = this.sanitizeIdentifier(alreadyExistsMatch[1]);
+
+      return {
+        errorCode: 2714,
+        level: 16,
+        state: 6,
+        serverName: this.serverName,
+        lineNumber: this.normalizeLineNumber(failure.lineNumber),
+        message: `There is already an object named '${objectName}' in the database.`,
+      };
+    }
+
+    const sqliteSyntaxMatch = raw.match(/near\s+"([^"]+)":\s*syntax error/i);
+    if (sqliteSyntaxMatch) {
+      return {
+        errorCode: 102,
+        level: 15,
+        state: 1,
+        serverName: this.serverName,
+        lineNumber: this.normalizeLineNumber(failure.lineNumber),
+        message: `Incorrect syntax near '${sqliteSyntaxMatch[1]}'.`,
       };
     }
 
@@ -123,9 +183,5 @@ export class ErrorFormatter {
 
   private sanitizeIdentifier(value: string): string {
     return value.trim().replace(/^['"`\[]+/, '').replace(/['"`\]]+$/, '');
-  }
-
-  private isPlainSyntaxFallback(rawError: string): boolean {
-    return /parse|syntax|unexpected/i.test(rawError);
   }
 }

@@ -263,6 +263,21 @@ export class ExecutionEngine {
     const tokenMatch = fromColumn.match(/^[A-Za-z_][A-Za-z0-9_]*|^[^\sA-Za-z0-9_]/);
 
     if (tokenMatch?.[0]) {
+      // If the parser points at punctuation, prefer the preceding identifier
+      // for clearer SQL Server-style syntax messaging (e.g., misspelled keyword).
+      if (/^[;,:.)]$/.test(tokenMatch[0])) {
+        const beforeColumn = sourceLine.slice(0, zeroBasedColumn);
+        const previousIdentifier = beforeColumn.match(/([A-Za-z_][A-Za-z0-9_]*)[^A-Za-z0-9_]*$/);
+        if (previousIdentifier?.[1]) {
+          return previousIdentifier[1];
+        }
+
+        const firstIdentifier = sourceLine.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)/);
+        if (firstIdentifier?.[1]) {
+          return firstIdentifier[1];
+        }
+      }
+
       return tokenMatch[0];
     }
 
