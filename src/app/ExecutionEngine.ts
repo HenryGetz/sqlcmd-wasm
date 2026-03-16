@@ -263,26 +263,98 @@ export class ExecutionEngine {
     const tokenMatch = fromColumn.match(/^[A-Za-z_][A-Za-z0-9_]*|^[^\sA-Za-z0-9_]/);
 
     if (tokenMatch?.[0]) {
-      // If the parser points at punctuation, prefer the preceding identifier
-      // for clearer SQL Server-style syntax messaging (e.g., misspelled keyword).
-      if (/^[;,:.)]$/.test(tokenMatch[0])) {
-        const beforeColumn = sourceLine.slice(0, zeroBasedColumn);
-        const previousIdentifier = beforeColumn.match(/([A-Za-z_][A-Za-z0-9_]*)[^A-Za-z0-9_]*$/);
-        if (previousIdentifier?.[1]) {
-          return previousIdentifier[1];
-        }
+      const token = tokenMatch[0];
 
-        const firstIdentifier = sourceLine.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)/);
-        if (firstIdentifier?.[1]) {
-          return firstIdentifier[1];
+      if (token === ';') {
+        const tokenBeforeSemicolon = this.extractTokenBeforeSemicolon(sourceLine, zeroBasedColumn);
+        if (tokenBeforeSemicolon) {
+          return tokenBeforeSemicolon;
         }
       }
 
-      return tokenMatch[0];
+      return token;
+    }
+
+    if (zeroBasedColumn >= sourceLine.length && /;\s*$/.test(sourceLine)) {
+      const semicolonIndex = sourceLine.lastIndexOf(';');
+      const tokenBeforeSemicolon = this.extractTokenBeforeSemicolon(sourceLine, semicolonIndex);
+      if (tokenBeforeSemicolon) {
+        return tokenBeforeSemicolon;
+      }
+
+      return ';';
     }
 
     const firstTokenMatch = sourceLine.trim().match(/^[A-Za-z_][A-Za-z0-9_]*|^[^\sA-Za-z0-9_]/);
     return firstTokenMatch?.[0];
+  }
+
+  /**
+   * Recover a useful token when parser coordinates land on (or just after) ';'.
+   */
+  private extractTokenBeforeSemicolon(sourceLine: string, semicolonIndex: number): string | undefined {
+    const beforeSemicolon = sourceLine.slice(0, semicolonIndex);
+    const identifierMatches = beforeSemicolon.match(/[A-Za-z_][A-Za-z0-9_]*/g);
+    const firstIdentifier = identifierMatches?.[0];
+    const lastIdentifier = identifierMatches
+      ? identifierMatches[identifierMatches.length - 1]
+      : undefined;
+
+    const trailingSymbolMatch = beforeSemicolon.match(/([^\w\s])\s*$/);
+    const trailingSymbol = trailingSymbolMatch?.[1];
+
+    if (trailingSymbol) {
+      // Quotes near semicolon are usually fallout from an earlier typo;
+      // prefer the statement identifier over punctuation-only diagnostics.
+      if (/^["'`]$/.test(trailingSymbol) && firstIdentifier) {
+        return firstIdentifier;
+      }
+
+      // If a malformed leading keyword is present, that is usually more
+      // actionable than a trailing closing delimiter.
+      if (
+        /^[\])]$/.test(trailingSymbol) &&
+        firstIdentifier &&
+        !this.isLikelySqlKeyword(firstIdentifier)
+      ) {
+        return firstIdentifier;
+      }
+
+      return trailingSymbol;
+    }
+
+    if (lastIdentifier) {
+      return lastIdentifier;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Heuristic keyword check used only for semicolon-position fallback messaging.
+   */
+  private isLikelySqlKeyword(token: string): boolean {
+    const normalized = token.toUpperCase();
+
+    return (
+      normalized === 'SELECT' ||
+      normalized === 'INSERT' ||
+      normalized === 'UPDATE' ||
+      normalized === 'DELETE' ||
+      normalized === 'MERGE' ||
+      normalized === 'CREATE' ||
+      normalized === 'ALTER' ||
+      normalized === 'DROP' ||
+      normalized === 'TRUNCATE' ||
+      normalized === 'DECLARE' ||
+      normalized === 'SET' ||
+      normalized === 'WITH' ||
+      normalized === 'IF' ||
+      normalized === 'BEGIN' ||
+      normalized === 'EXEC' ||
+      normalized === 'EXECUTE' ||
+      normalized === 'USE'
+    );
   }
 
   /**

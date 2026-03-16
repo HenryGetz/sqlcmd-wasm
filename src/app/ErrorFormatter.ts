@@ -109,9 +109,9 @@ export class ErrorFormatter {
     const notNullConstraintMatch = raw.match(/NOT NULL constraint failed:\s*([^\n]+)/i);
     if (notNullConstraintMatch) {
       const columnPath = this.sanitizeIdentifier(notNullConstraintMatch[1]);
-      const columnName = columnPath.includes('.')
-        ? columnPath.slice(columnPath.lastIndexOf('.') + 1)
-        : columnPath;
+      const columnName = this.sanitizeIdentifier(
+        columnPath.includes('.') ? columnPath.slice(columnPath.lastIndexOf('.') + 1) : columnPath,
+      );
 
       return {
         errorCode: 515,
@@ -123,7 +123,7 @@ export class ErrorFormatter {
       };
     }
 
-    const alreadyExistsMatch = raw.match(/table\s+([^\s]+)\s+already exists/i);
+    const alreadyExistsMatch = raw.match(/\btable\s+([^\n]+?)\s+already exists\b/i);
     if (alreadyExistsMatch) {
       const objectName = this.sanitizeIdentifier(alreadyExistsMatch[1]);
 
@@ -182,6 +182,24 @@ export class ErrorFormatter {
   }
 
   private sanitizeIdentifier(value: string): string {
-    return value.trim().replace(/^['"`\[]+/, '').replace(/['"`\]]+$/, '');
+    const trimmed = value.trim();
+
+    if (trimmed.length < 2) {
+      return trimmed;
+    }
+
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      return trimmed.slice(1, -1);
+    }
+
+    if (
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+      (trimmed.startsWith('`') && trimmed.endsWith('`'))
+    ) {
+      return trimmed.slice(1, -1);
+    }
+
+    return trimmed;
   }
 }
