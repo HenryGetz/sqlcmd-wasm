@@ -97,7 +97,7 @@ export class TerminalUI {
   }
 
   /**
-   * Write an informational line in cyan.
+   * Write an informational line.
    */
   public writeInfo(message: string): void {
     this.terminal.writeln(message);
