@@ -1,12 +1,12 @@
 # sqlcmd-wasm
 
-Because sometimes you want to test T-SQL in a browser tab instead of installing half of Microsoft's ecosystem just to check whether `GO` is in the right spot.
+Because sometimes you want to test SQL Server syntax in a browser tab instead of installing half of Microsoft's ecosystem just to check whether `GO` is in the right spot.
 
 `sqlcmd-wasm` is a browser-first emulator of the `sqlcmd` REPL. It gives you the familiar multi-line prompt workflow (`1>`, `2>`, `GO`) while running entirely in the browser with WebAssembly.
 
 It is intentionally opinionated:
-- It accepts SQL Server-flavored input (T-SQL).
-- It transpiles T-SQL to SQLite-compatible SQL using `@polyglot-sql/sdk`.
+- It accepts SQL Server-flavored input.
+- It transpiles SQL Server SQL (aka T-SQL) to SQLite-compatible SQL using `@polyglot-sql/sdk`.
 - It executes the translated SQL in `sql.js` (SQLite in WASM).
 - It renders results and errors in a terminal-like UI using `xterm.js`.
 
@@ -15,9 +15,9 @@ So yes, it is a SQL Server-ish REPL with zero SQL Server process running.
 ## Why This Exists
 
 If you build SQL tooling, teach SQL, prototype query flows, or just want fast feedback loops, this gives you:
-- A fully browser-based environment for testing T-SQL syntax and interactive batch behavior.
+- A fully browser-based environment for testing SQL Server syntax and interactive batch behavior.
 - No local database server required.
-- Portable architecture you can embed into larger tools (like BuddySQL).
+- Portable architecture you can embed into larger tools.
 
 It is very good for:
 - REPL behavior testing (`GO`, buffers, variable substitution, directives).
@@ -32,7 +32,7 @@ It is not trying to be:
 
 - `Vite` + `TypeScript`
 - `xterm.js` for terminal UI
-- `@polyglot-sql/sdk` for T-SQL -> SQLite transpilation
+- `@polyglot-sql/sdk` for SQL Server SQL -> SQLite transpilation
 - `sql.js` for SQLite WASM execution
 
 ## Quick Start
@@ -115,12 +115,11 @@ This split is deliberate so the REPL core can be reused in other apps.
 ## Limitations (a.k.a. Honest Fine Print)
 
 - Runtime semantics are SQLite-backed, not true SQL Server engine semantics.
-- Some T-SQL features may transpile imperfectly or be unsupported.
+- Some SQL Server-specific features may transpile imperfectly or be unsupported.
 - `:r` uses browser file picker APIs, so it behaves like web UX, not local shell access.
 
-Still, for fast interactive T-SQL testing in-browser, it is extremely useful.
+Still, for fast interactive SQL Server syntax testing in-browser, it is extremely useful.
 
 ## License
 
 MIT (project dependencies keep their own licenses).
-
