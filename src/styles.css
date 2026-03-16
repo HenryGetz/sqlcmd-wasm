@@ -1,0 +1,89 @@
+@font-face {
+  font-family: "CascadiaMonoLocal";
+  src: url("./assets/fonts/cascadia-mono-regular.ttf") format("truetype");
+  font-style: normal;
+  font-weight: normal;
+  font-display: swap;
+}
+
+:root {
+  font-family: "CascadiaMonoLocal", "Cascadia Mono", "Consolas", "Lucida Console", monospace;
+  font-size: 16px;
+  font-weight: normal;
+  color: #cccccc;
+  background: #0c0c0c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "CascadiaMonoLocal", "Cascadia Mono", "Consolas", "Lucida Console", monospace;
+  font-size: 16px;
+  font-weight: normal;
+  line-height: 1.2;
+  background: #0c0c0c;
+  color: #cccccc;
+  overflow: hidden;
+}
+
+.terminal-shell {
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  background: #0c0c0c;
+}
+
+.terminal-mount {
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 0;
+  overflow: hidden;
+  background: #0c0c0c;
+}
+
+.xterm,
+.xterm-viewport,
+.xterm-screen {
+  height: 100%;
+  background: #0c0c0c;
+  color: #cccccc;
+  line-height: 1.2;
+}
+
+.xterm .xterm-helper-textarea {
+  outline: none !important;
+  border: none !important;
+  background: transparent !important;
+  color: inherit !important;
+  font: inherit !important;
+}
+
+/* Keep scrollbars basic and square, close to default Windows behavior. */
+.xterm-viewport {
+  scrollbar-width: auto;
+}
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: #1e1e1e;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: #6a6a6a;
+  border-radius: 0;
+}
