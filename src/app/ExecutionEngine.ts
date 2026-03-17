@@ -122,6 +122,30 @@ export class ExecutionEngine {
   }
 
   /**
+   * Return true when a schema alias is attached to the active SQLite connection.
+   */
+  public hasAttachedDatabase(alias: string): boolean {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) {
+      return false;
+    }
+
+    const resultSets = this.db.exec('PRAGMA database_list;');
+    const firstSet = resultSets[0];
+
+    if (!firstSet) {
+      return false;
+    }
+
+    const nameColumnIndex = firstSet.columns.findIndex((columnName) => columnName === 'name');
+
+    if (nameColumnIndex < 0) {
+      return false;
+    }
+
+    return firstSet.values.some((row) => String(row[nameColumnIndex]) === alias);
+  }
+
+  /**
    * Transpile T-SQL to SQLite SQL, then execute it one or many times.
    */
   public executeBatch(tsqlBatch: string, repeatCount: number): BatchExecutionResult {
@@ -168,7 +192,7 @@ export class ExecutionEngine {
     }
 
     const translatedStatements = (transpileResult.sql ?? [])
-      .map((statement) => statement.trim())
+      .map((statement) => this.normalizeTranspiledSqliteStatement(statement.trim()))
       .filter((statement) => statement.length > 0);
 
     const sourceStatementStartLines = this.computeSourceStatementStartLines(tsqlBatch);
@@ -317,6 +341,18 @@ export class ExecutionEngine {
     }
 
     return String(error);
+  }
+
+  /**
+   * Patch known transpiler output forms that SQLite cannot execute directly.
+   */
+  private normalizeTranspiledSqliteStatement(statement: string): string {
+    return statement
+      .replace(/\bAUTOINCREMENT\s+START\s+\d+\s+INCREMENT\s+\d+\b/gi, 'AUTOINCREMENT')
+      .replace(
+        /(\b[A-Za-z]+(?:\([^)]*\))?)\s+FOREIGN\s+KEY\s+REFERENCES\b/gi,
+        '$1 REFERENCES',
+      );
   }
 
   /**

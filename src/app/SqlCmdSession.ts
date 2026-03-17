@@ -11,6 +11,34 @@ import type {
 import { formatResultSetAsAsciiTable } from './formatters/tableFormatter';
 import type { OnErrorMode } from './types';
 
+type BufferedBatchOperation =
+  | {
+      kind: 'sql';
+      lineNumber: number;
+      sql: string;
+      repeatCount: number;
+    }
+  | {
+      kind: 'create-database';
+      lineNumber: number;
+      databaseName: string;
+    }
+  | {
+      kind: 'use-database';
+      lineNumber: number;
+      databaseName: string;
+    }
+  | {
+      kind: 'drop-database';
+      lineNumber: number;
+      databaseName: string;
+    }
+  | {
+      kind: 'invalid-directive';
+      lineNumber: number;
+      message: string;
+    };
+
 /**
  * Coordinates UI input, directive handling, buffering rules, and SQL execution.
  */
@@ -21,6 +49,7 @@ export class SqlCmdSession {
   private isLoadingFile = false;
   private isBootstrapping = false;
   private onErrorMode: OnErrorMode = 'ignore';
+  private activeDatabaseAlias: string | null = null;
 
   private readonly errorFormatter = new ErrorFormatter('WasmSQL');
 
@@ -650,8 +679,9 @@ export class SqlCmdSession {
 
     try {
       const bufferedSql = this.bufferLines.join('\n');
+      const operations = this.parseBufferedBatchOperations(bufferedSql);
 
-      if (bufferedSql.trim().length === 0) {
+      if (operations.length === 0) {
         this.reportClientError(
           'Nothing to execute: this batch only contains blank lines. Type SQL before GO, or use RESET.',
           1,
@@ -662,50 +692,360 @@ export class SqlCmdSession {
         return;
       }
 
-      const expansion = this.parser.expandVariables(bufferedSql);
+      const allResultSets: Array<{ columns: string[]; rows: string[][] }> = [];
+      let totalRowsAffected = 0;
+      let executedSqlBatchCount = 0;
 
-      if (expansion.missingVariables.length > 0) {
-        this.reportClientError(
-          `Undefined scripting variable(s): ${expansion.missingVariables.join(', ')}`,
-          1,
-        );
-        if (!this.isDisconnected) {
-          this.resetBufferAndPrompt();
+      for (let iteration = 1; iteration <= goCount; iteration += 1) {
+        for (const operation of operations) {
+          if (operation.kind === 'invalid-directive') {
+            this.reportClientError(operation.message, operation.lineNumber);
+            if (!this.isDisconnected) {
+              this.resetBufferAndPrompt();
+            }
+            return;
+          }
+
+          if (operation.kind === 'create-database') {
+            if (!this.executeCreateDatabaseDirective(operation.databaseName, operation.lineNumber)) {
+              if (!this.isDisconnected) {
+                this.resetBufferAndPrompt();
+              }
+              return;
+            }
+            continue;
+          }
+
+          if (operation.kind === 'use-database') {
+            if (!this.executeUseDatabaseDirective(operation.databaseName, operation.lineNumber)) {
+              if (!this.isDisconnected) {
+                this.resetBufferAndPrompt();
+              }
+              return;
+            }
+            continue;
+          }
+
+          if (operation.kind === 'drop-database') {
+            if (!this.executeDropDatabaseDirective(operation.databaseName, operation.lineNumber)) {
+              if (!this.isDisconnected) {
+                this.resetBufferAndPrompt();
+              }
+              return;
+            }
+            continue;
+          }
+
+          const result = this.executeSqlOperation(operation);
+
+          if (!result) {
+            if (!this.isDisconnected) {
+              this.resetBufferAndPrompt();
+            }
+            return;
+          }
+
+          allResultSets.push(...result.resultSets);
+          totalRowsAffected += result.rowsAffected;
+          executedSqlBatchCount += 1;
         }
-        return;
       }
 
-      const executionResult = this.engine.executeBatch(expansion.expandedSql, goCount);
-
-      if (!executionResult.ok) {
-        this.reportExecutionFailure(executionResult);
-        if (!this.isDisconnected) {
-          this.resetBufferAndPrompt();
-        }
-        return;
-      }
-
-      if (executionResult.resultSets.length > 0) {
-        for (let i = 0; i < executionResult.resultSets.length; i += 1) {
-          const resultSet = executionResult.resultSets[i];
+      if (allResultSets.length > 0) {
+        for (let i = 0; i < allResultSets.length; i += 1) {
+          const resultSet = allResultSets[i];
           const table = formatResultSetAsAsciiTable(resultSet);
 
           for (const tableLine of table.split('\n')) {
             this.terminalUi.writeLine(tableLine);
           }
 
-          if (i < executionResult.resultSets.length - 1) {
+          if (i < allResultSets.length - 1) {
             this.terminalUi.writeLine();
           }
         }
       }
 
-      this.terminalUi.writeLine(`(${executionResult.rowsAffected} rows affected)`);
+      if (executedSqlBatchCount > 0) {
+        this.terminalUi.writeLine(`(${totalRowsAffected} rows affected)`);
+      } else {
+        this.terminalUi.writeInfo('Commands completed successfully.');
+      }
+
       this.resetBufferAndPrompt();
     } finally {
       this.isExecuting = false;
       this.terminalUi.setInputEnabled(true);
     }
+  }
+
+  private parseBufferedBatchOperations(batchSql: string): BufferedBatchOperation[] {
+    const lines = batchSql.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    const operations: BufferedBatchOperation[] = [];
+
+    let currentSqlLines: string[] = [];
+    let currentSqlStartLine = 1;
+
+    const flushCurrentSqlLines = (repeatCount: number): void => {
+      if (currentSqlLines.length === 0) {
+        return;
+      }
+
+      const sql = currentSqlLines.join('\n');
+
+      if (sql.trim().length > 0) {
+        operations.push({
+          kind: 'sql',
+          lineNumber: currentSqlStartLine,
+          sql,
+          repeatCount,
+        });
+      }
+
+      currentSqlLines = [];
+    };
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      const lineNumber = index + 1;
+      const trimmed = line.trim();
+
+      if (trimmed.length === 0) {
+        if (currentSqlLines.length > 0) {
+          currentSqlLines.push(line);
+        }
+
+        continue;
+      }
+
+      const goMatch = trimmed.match(/^GO(?:\s+(\d+))?\s*(?:--.*)?$/i);
+
+      if (goMatch) {
+        const repeatCount = goMatch[1] ? Number.parseInt(goMatch[1], 10) : 1;
+
+        if (!Number.isSafeInteger(repeatCount) || repeatCount < 1) {
+          operations.push({
+            kind: 'invalid-directive',
+            lineNumber,
+            message: `Invalid GO count '${goMatch[1]}'. GO count must be a positive integer.`,
+          });
+        } else {
+          flushCurrentSqlLines(repeatCount);
+        }
+
+        continue;
+      }
+
+      const createDatabaseMatch = trimmed.match(
+        /^CREATE\s+DATABASE\s+(.+?)\s*;?\s*(?:--.*)?$/i,
+      );
+
+      if (createDatabaseMatch) {
+        flushCurrentSqlLines(1);
+        const databaseName = this.parseDatabaseAlias(createDatabaseMatch[1]);
+
+        if (!databaseName) {
+          operations.push({
+            kind: 'invalid-directive',
+            lineNumber,
+            message:
+              'Invalid CREATE DATABASE name. Use a simple identifier like CoffeeShopDB or [CoffeeShopDB].',
+          });
+        } else {
+          operations.push({
+            kind: 'create-database',
+            lineNumber,
+            databaseName,
+          });
+        }
+
+        continue;
+      }
+
+      const useDatabaseMatch = trimmed.match(/^USE\s+(.+?)\s*;?\s*(?:--.*)?$/i);
+
+      if (useDatabaseMatch) {
+        flushCurrentSqlLines(1);
+        const databaseName = this.parseDatabaseAlias(useDatabaseMatch[1]);
+
+        if (!databaseName) {
+          operations.push({
+            kind: 'invalid-directive',
+            lineNumber,
+            message: 'Invalid USE target. Use a simple identifier like CoffeeShopDB.',
+          });
+        } else {
+          operations.push({
+            kind: 'use-database',
+            lineNumber,
+            databaseName,
+          });
+        }
+
+        continue;
+      }
+
+      const dropDatabaseMatch = trimmed.match(/^DROP\s+DATABASE\s+(.+?)\s*;?\s*(?:--.*)?$/i);
+
+      if (dropDatabaseMatch) {
+        flushCurrentSqlLines(1);
+        const databaseName = this.parseDatabaseAlias(dropDatabaseMatch[1]);
+
+        if (!databaseName) {
+          operations.push({
+            kind: 'invalid-directive',
+            lineNumber,
+            message: 'Invalid DROP DATABASE target. Use a simple identifier like CoffeeShopDB.',
+          });
+        } else {
+          operations.push({
+            kind: 'drop-database',
+            lineNumber,
+            databaseName,
+          });
+        }
+
+        continue;
+      }
+
+      if (currentSqlLines.length === 0) {
+        currentSqlStartLine = lineNumber;
+      }
+
+      currentSqlLines.push(line);
+    }
+
+    flushCurrentSqlLines(1);
+
+    return operations;
+  }
+
+  private parseDatabaseAlias(rawValue: string): string | null {
+    let normalized = rawValue.trim();
+
+    if (/^\[[^\]]+\]$/.test(normalized)) {
+      normalized = normalized.slice(1, -1);
+    } else if (/^"[^"]+"$/.test(normalized) || /^`[^`]+`$/.test(normalized)) {
+      normalized = normalized.slice(1, -1);
+    }
+
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(normalized)) {
+      return null;
+    }
+
+    if (/^(main|temp)$/i.test(normalized)) {
+      return null;
+    }
+
+    return normalized;
+  }
+
+  private executeCreateDatabaseDirective(databaseName: string, lineNumber: number): boolean {
+    if (this.engine.hasAttachedDatabase(databaseName)) {
+      this.reportClientError(`Database '${databaseName}' already exists in this session.`, lineNumber);
+      return false;
+    }
+
+    const attachResult = this.engine.executeSqliteScript(
+      `ATTACH DATABASE ':memory:' AS ${databaseName};`,
+    );
+
+    if (!attachResult.ok) {
+      this.reportClientError(
+        `Failed to create database '${databaseName}': ${attachResult.rawError}`,
+        lineNumber,
+      );
+      return false;
+    }
+
+    this.terminalUi.writeInfo(`Database '${databaseName}' created.`);
+    return true;
+  }
+
+  private executeUseDatabaseDirective(databaseName: string, lineNumber: number): boolean {
+    if (!this.engine.hasAttachedDatabase(databaseName)) {
+      this.reportClientError(
+        `Cannot USE database '${databaseName}' because it is not attached. Run CREATE DATABASE first.`,
+        lineNumber,
+      );
+      return false;
+    }
+
+    this.activeDatabaseAlias = databaseName;
+    this.terminalUi.writeInfo(`Changed database context to '${databaseName}'.`);
+    return true;
+  }
+
+  private executeDropDatabaseDirective(databaseName: string, lineNumber: number): boolean {
+    if (!this.engine.hasAttachedDatabase(databaseName)) {
+      this.reportClientError(`Cannot DROP database '${databaseName}' because it does not exist.`, lineNumber);
+      return false;
+    }
+
+    const detachResult = this.engine.executeSqliteScript(`DETACH DATABASE ${databaseName};`);
+
+    if (!detachResult.ok) {
+      this.reportClientError(
+        `Failed to drop database '${databaseName}': ${detachResult.rawError}`,
+        lineNumber,
+      );
+      return false;
+    }
+
+    if (this.activeDatabaseAlias === databaseName) {
+      this.activeDatabaseAlias = null;
+    }
+
+    this.terminalUi.writeInfo(`Database '${databaseName}' dropped.`);
+    return true;
+  }
+
+  private executeSqlOperation(operation: Extract<BufferedBatchOperation, { kind: 'sql' }>): {
+    resultSets: Array<{ columns: string[]; rows: string[][] }>;
+    rowsAffected: number;
+  } | null {
+    const sqlWithContext = this.applyActiveDatabaseContext(operation.sql);
+    const expansion = this.parser.expandVariables(sqlWithContext);
+
+    if (expansion.missingVariables.length > 0) {
+      this.reportClientError(
+        `Undefined scripting variable(s): ${expansion.missingVariables.join(', ')}`,
+        operation.lineNumber,
+      );
+      return null;
+    }
+
+    const executionResult = this.engine.executeBatch(expansion.expandedSql, operation.repeatCount);
+
+    if (!executionResult.ok) {
+      this.reportExecutionFailure(executionResult);
+      return null;
+    }
+
+    return {
+      resultSets: executionResult.resultSets,
+      rowsAffected: executionResult.rowsAffected,
+    };
+  }
+
+  private applyActiveDatabaseContext(sqlBatch: string): string {
+    if (!this.activeDatabaseAlias) {
+      return sqlBatch;
+    }
+
+    const activeAlias = this.activeDatabaseAlias;
+
+    const qualified = sqlBatch
+      .replace(
+        /(\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?![A-Za-z_][A-Za-z0-9_]*\.)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        `$1${activeAlias}.$2`,
+      )
+      .replace(
+        /(\b(?:FROM|JOIN|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+)(sqlite_master|sqlite_schema)\b/gi,
+        `$1${activeAlias}.$2`,
+      );
+
+    return qualified;
   }
 
   private resetBufferAndPrompt(): void {

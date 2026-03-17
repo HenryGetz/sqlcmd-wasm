@@ -12,8 +12,8 @@ export class TerminalUI {
   private currentInput = '';
   private lineHandler: ((line: string) => void | Promise<void>) | null = null;
 
-  private suppressDuplicateEnter = false;
-  private enterDebounceTimerId: number | null = null;
+  private previousInputEndedWithCarriageReturn = false;
+  private isConsumingAnsiEscapeSequence = false;
 
   private isPermanentlyLocked = false;
   private isTemporarilyDisabled = false;
@@ -137,23 +137,25 @@ export class TerminalUI {
     }
 
     for (const char of chunk) {
+      if (this.isConsumingAnsiEscapeSequence) {
+        if (this.isAnsiEscapeTerminator(char)) {
+          this.isConsumingAnsiEscapeSequence = false;
+        }
+
+        continue;
+      }
+
+      if (char === '\n' && this.previousInputEndedWithCarriageReturn) {
+        this.previousInputEndedWithCarriageReturn = false;
+        continue;
+      }
+
+      this.previousInputEndedWithCarriageReturn = false;
+
       if (char === '\r' || char === '\n') {
-        // Some environments emit duplicate Enter characters back-to-back.
-        // Debouncing keeps one logical submit per physical key press.
-        if (this.suppressDuplicateEnter) {
-          continue;
+        if (char === '\r') {
+          this.previousInputEndedWithCarriageReturn = true;
         }
-
-        this.suppressDuplicateEnter = true;
-
-        if (this.enterDebounceTimerId !== null) {
-          window.clearTimeout(this.enterDebounceTimerId);
-        }
-
-        this.enterDebounceTimerId = window.setTimeout(() => {
-          this.suppressDuplicateEnter = false;
-          this.enterDebounceTimerId = null;
-        }, 30);
 
         this.submitCurrentLine();
         continue;
@@ -171,8 +173,9 @@ export class TerminalUI {
         continue;
       }
 
-      if (char.startsWith('\u001b')) {
-        // Ignore escape sequences (arrow keys, etc.) for this minimal emulator.
+      if (char === '\u001b') {
+        // Consume ANSI escape/control sequences (arrow keys, etc.).
+        this.isConsumingAnsiEscapeSequence = true;
         continue;
       }
 
@@ -204,5 +207,12 @@ export class TerminalUI {
 
   private isPrintable(char: string): boolean {
     return char >= ' ' && char !== '\u007f';
+  }
+
+  /**
+   * ANSI escape sequences terminate with a final byte in the 0x40-0x7E range.
+   */
+  private isAnsiEscapeTerminator(char: string): boolean {
+    return char >= '@' && char <= '~';
   }
 }

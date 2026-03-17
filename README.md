@@ -118,6 +118,15 @@ When `sql`, `sql64`, and `sqlUrl`/`sqlFile` are mixed, they are loaded in URL qu
 - `:Help`: Show in-terminal help.
 - `!! cls`: Clear terminal viewport like `cls`.
 
+When executing imported SQL, sqlcmd-style `GO` separator lines are honored as true batch separators.
+
+Database context directives are mapped to SQLite multi-database behavior:
+- `CREATE DATABASE X` -> `ATTACH DATABASE ':memory:' AS X`
+- `USE X` -> switches active schema context to `X`
+- `DROP DATABASE X` -> `DETACH DATABASE X`
+
+With an active `USE` context, unqualified `CREATE TABLE` statements are created in that attached schema, and `sqlite_master` / `sqlite_schema` queries are scoped to the active schema so table discovery behaves as expected.
+
 ## Error Formatting
 
 Errors are normalized to SQL Server-style output:
