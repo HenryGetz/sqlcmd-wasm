@@ -118,6 +118,45 @@ export class TerminalUI {
   }
 
   /**
+   * Inject raw terminal input bytes (used by headless automation).
+   */
+  public injectInput(chunk: string): void {
+    this.handleInputChunk(chunk);
+  }
+
+  /**
+   * Send a full line exactly like typing text and pressing Enter.
+   */
+  public injectLine(line: string): void {
+    this.handleInputChunk(line);
+    this.handleInputChunk('\r');
+  }
+
+  /**
+   * Snapshot all visible + scrollback terminal text.
+   */
+  public getTranscript(): string {
+    const activeBuffer = this.terminal.buffer.active;
+    const lines: string[] = [];
+
+    for (let index = 0; index < activeBuffer.length; index += 1) {
+      const bufferLine = activeBuffer.getLine(index);
+
+      if (!bufferLine) {
+        continue;
+      }
+
+      lines.push(bufferLine.translateToString(true));
+    }
+
+    while (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
    * Temporarily pause input while asynchronous execution is running.
    */
   public setInputEnabled(enabled: boolean): void {

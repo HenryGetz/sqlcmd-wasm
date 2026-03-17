@@ -75,6 +75,18 @@ export class CommandParser {
       };
     }
 
+    const unquotedSetVarMatch = trimmed.match(
+      /^:setvar\s+([A-Za-z_][A-Za-z0-9_]*)\s+([^\s"].*)$/i,
+    );
+    if (unquotedSetVarMatch) {
+      const [, name, unquotedValue] = unquotedSetVarMatch;
+      return {
+        kind: 'setvar',
+        name,
+        value: unquotedValue.trim(),
+      };
+    }
+
     const goMatch = trimmed.match(/^go(?:\s+(\d+))?$/i);
     if (goMatch) {
       const countToken = goMatch[1];
@@ -93,7 +105,8 @@ export class CommandParser {
     if (/^:setvar\b/i.test(trimmed)) {
       return {
         kind: 'invalid',
-        message: 'Invalid :setvar syntax. Use: :setvar Name "value"',
+        message:
+          'Invalid :setvar syntax. Use: :setvar Name "value" or :setvar Name value',
       };
     }
 

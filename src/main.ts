@@ -8,6 +8,21 @@ import { SqlCmdSession } from './app/SqlCmdSession';
 import { TerminalUI } from './app/TerminalUI';
 import { parseUrlStartupOptions } from './app/UrlStartupOptions';
 
+interface SqlCmdAutomationBridge {
+  injectInput: (chunk: string) => void;
+  injectLine: (line: string) => void;
+  getTranscript: () => string;
+  isIdle: () => boolean;
+  waitForIdle: (timeoutMs?: number) => Promise<boolean>;
+}
+
+declare global {
+  interface Window {
+    __sqlcmdAutomation?: SqlCmdAutomationBridge;
+    __sqlcmdSession?: SqlCmdSession;
+  }
+}
+
 /**
  * Application bootstrap.
  *
@@ -49,9 +64,40 @@ async function bootstrap(): Promise<void> {
     persistenceStore,
   );
 
+  const url = new URL(window.location.href);
+  const enableAutomationBridge =
+    import.meta.env.DEV || url.searchParams.get('automation') === '1';
+
+  if (enableAutomationBridge) {
+    window.__sqlcmdAutomation = {
+      injectInput: (chunk) => {
+        terminalUi.injectInput(chunk);
+      },
+      injectLine: (line) => {
+        terminalUi.injectLine(line);
+      },
+      getTranscript: () => terminalUi.getTranscript(),
+      isIdle: () => session.isIdleForAutomation(),
+      waitForIdle: async (timeoutMs = 5_000) => {
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+          if (session.isIdleForAutomation()) {
+            return true;
+          }
+
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, 20);
+          });
+        }
+
+        return false;
+      },
+    };
+  }
+
   if (import.meta.env.DEV) {
-    (window as Window & { __sqlcmdSession?: SqlCmdSession }).__sqlcmdSession =
-      session;
+    window.__sqlcmdSession = session;
   }
 
   await session.start();

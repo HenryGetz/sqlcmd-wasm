@@ -56,6 +56,7 @@ export class SqlCmdSession {
   private activeDatabaseAlias: string | null = null;
   private isReplayingPersistedOperations = false;
   private persistenceWritesDisabled = false;
+  private hasStarted = false;
 
   private readonly errorFormatter = new ErrorFormatter('WasmSQL');
 
@@ -66,6 +67,19 @@ export class SqlCmdSession {
     private readonly startupOptions: UrlStartupOptions,
     private readonly persistenceStore: PersistenceStore,
   ) {}
+
+  /**
+   * Exposed for headless automation so CLI tests can wait for settled prompts.
+   */
+  public isIdleForAutomation(): boolean {
+    return (
+      this.hasStarted &&
+      !this.isDisconnected &&
+      !this.isExecuting &&
+      !this.isLoadingFile &&
+      !this.isBootstrapping
+    );
+  }
 
   /**
    * Show intro banner and start accepting terminal lines.
@@ -92,6 +106,8 @@ export class SqlCmdSession {
     if (!alreadyRenderedPrompt) {
       this.renderCurrentPrompt();
     }
+
+    this.hasStarted = true;
   }
 
   private async restorePersistedOperations(): Promise<void> {
@@ -392,6 +408,8 @@ export class SqlCmdSession {
       const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
       const bytes = await this.fetchStartupResourceBytes(resolvedUrl);
       this.engine.loadDatabaseFromBytes(bytes);
+      // Replacing main DB invalidates any previously restored USE context.
+      this.activeDatabaseAlias = null;
       this.terminalUi.writeInfo(
         `Startup: Loaded SQLite database from ${requestedSource} (${bytes.byteLength} bytes).`,
       );
@@ -552,6 +570,12 @@ export class SqlCmdSession {
       }
 
       case 'go': {
+        if (this.isInsideOpenBlockComment(this.bufferLines)) {
+          this.bufferLines.push(line);
+          this.renderPromptIfActive();
+          return;
+        }
+
         await this.executeBufferedBatch(action.count);
         return;
       }
@@ -875,7 +899,7 @@ export class SqlCmdSession {
       'QUIT | EXIT              Terminate the session.',
     );
     this.terminalUi.writeLine(
-      ':setvar Name "value"     Define a scripting variable.',
+      ':setvar Name value|"value" Define a scripting variable.',
     );
     this.terminalUi.writeLine(
       ':listvar                 List all scripting variables.',
@@ -911,7 +935,7 @@ export class SqlCmdSession {
     this.terminalUi.writeLine('Useful Commands');
     this.terminalUi.writeLine('---------------');
     this.terminalUi.writeLine(':r [filename]            Import a local .sql/.txt file into the batch.');
-    this.terminalUi.writeLine(':setvar Name "value"     Define $(Name) variable values.');
+    this.terminalUi.writeLine(':setvar Name value|"value" Define $(Name) variable values.');
     this.terminalUi.writeLine(':listvar                 Show currently defined variables.');
     this.terminalUi.writeLine(':On Error [exit|ignore]  Exit on first error, or continue.');
     this.terminalUi.writeLine('!! cls                   Clear terminal output.');
@@ -1099,6 +1123,7 @@ export class SqlCmdSession {
 
     let currentSqlLines: string[] = [];
     let currentSqlStartLine = 1;
+    let insideBlockComment = false;
 
     const flushCurrentSqlLines = (repeatCount: number): void => {
       if (currentSqlLines.length === 0) {
@@ -1122,7 +1147,14 @@ export class SqlCmdSession {
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
       const lineNumber = index + 1;
-      const trimmed = line.trim();
+      const analyzedLine = this.analyzeLineForDirectiveParsing(
+        line,
+        insideBlockComment,
+      );
+
+      insideBlockComment = analyzedLine.endsInBlockComment;
+
+      const trimmed = analyzedLine.visibleText.trim();
 
       if (trimmed.length === 0) {
         if (currentSqlLines.length > 0) {
@@ -1236,6 +1268,63 @@ export class SqlCmdSession {
     flushCurrentSqlLines(1);
 
     return operations;
+  }
+
+  private analyzeLineForDirectiveParsing(
+    line: string,
+    startsInBlockComment: boolean,
+  ): {
+    visibleText: string;
+    endsInBlockComment: boolean;
+  } {
+    let visibleText = '';
+    let index = 0;
+    let inBlockComment = startsInBlockComment;
+
+    while (index < line.length) {
+      const current = line[index];
+      const next = line[index + 1] ?? '';
+
+      if (inBlockComment) {
+        if (current === '*' && next === '/') {
+          inBlockComment = false;
+          index += 2;
+          continue;
+        }
+
+        index += 1;
+        continue;
+      }
+
+      if (current === '/' && next === '*') {
+        inBlockComment = true;
+        index += 2;
+        continue;
+      }
+
+      if (current === '-' && next === '-') {
+        break;
+      }
+
+      visibleText += current;
+      index += 1;
+    }
+
+    return {
+      visibleText,
+      endsInBlockComment: inBlockComment,
+    };
+  }
+
+  private isInsideOpenBlockComment(lines: string[]): boolean {
+    let inBlockComment = false;
+
+    for (const line of lines) {
+      const analysis = this.analyzeLineForDirectiveParsing(line, inBlockComment);
+      inBlockComment = analysis.endsInBlockComment;
+    }
+
+    return inBlockComment;
   }
 
   private parseDatabaseAlias(rawValue: string): string | null {
@@ -1398,8 +1487,8 @@ export class SqlCmdSession {
 
     const qualified = sqlBatch
       .replace(
-        /(\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?![A-Za-z_][A-Za-z0-9_]*\.)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
-        `$1${activeAlias}.$2`,
+        /(^|[;\n]\s*)(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?![A-Za-z_][A-Za-z0-9_]*\.)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gim,
+        `$1$2${activeAlias}.$3`,
       )
       .replace(
         /(\b(?:FROM|JOIN|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+)(sqlite_master|sqlite_schema)\b/gi,

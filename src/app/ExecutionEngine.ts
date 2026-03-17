@@ -373,7 +373,53 @@ export class ExecutionEngine {
       .replace(
         /(\b[A-Za-z]+(?:\([^)]*\))?)\s+FOREIGN\s+KEY\s+REFERENCES\b/gi,
         '$1 REFERENCES',
+      )
+      // T-SQL runtime function aliases that often survive transpilation.
+      .replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_TIMESTAMP')
+      .replace(/\bISNULL\s*\(/gi, 'IFNULL(')
+      .replace(/\bLEN\s*\(/gi, 'LENGTH(')
+      .replace(/\bYEAR\s*\(\s*([^()]+?)\s*\)/gi, "CAST(strftime('%Y', $1) AS INTEGER)")
+      .replace(/\bMONTH\s*\(\s*([^()]+?)\s*\)/gi, "CAST(strftime('%m', $1) AS INTEGER)")
+      .replace(/\bDAY\s*\(\s*([^()]+?)\s*\)/gi, "CAST(strftime('%d', $1) AS INTEGER)")
+      // Preserve numeric '+' semantics by only rewriting obviously string-oriented
+      // concatenation shapes that appear in transpiled output.
+      .replace(
+        /('(?:''|[^'])*')(\s*)\+(\s*)(?=(?:CAST\b|IFNULL\b|COALESCE\b|CONCAT\b|[A-Za-z_]|\(|'|"|`|\[))/gi,
+        (match, literal, leftSpace, rightSpace) => {
+          if (this.isNumericLikeStringLiteral(literal)) {
+            return match;
+          }
+
+          return `${literal}${leftSpace}||${rightSpace}`;
+        },
+      )
+      .replace(
+        /(\))(\s*)\+(\s*)('(?:''|[^'])*')/g,
+        (match, leftToken, leftSpace, rightSpace, literal) => {
+          if (this.isNumericLikeStringLiteral(literal)) {
+            return match;
+          }
+
+          return `${leftToken}${leftSpace}||${rightSpace}${literal}`;
+        },
       );
+  }
+
+  private isNumericLikeStringLiteral(literalToken: string): boolean {
+    if (!/^'(?:''|[^'])*'$/.test(literalToken)) {
+      return false;
+    }
+
+    const unquoted = literalToken
+      .slice(1, -1)
+      .replace(/''/g, "'")
+      .trim();
+
+    if (unquoted.length === 0) {
+      return false;
+    }
+
+    return /^[+-]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(unquoted);
   }
 
   private isLikelyReadOnlyStatement(statementSql: string): boolean {

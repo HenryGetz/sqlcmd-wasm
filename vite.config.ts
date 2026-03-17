@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import wasm from 'vite-plugin-wasm';
+import path from 'node:path';
 
 export default defineConfig(() => {
   const explicitBase = process.env.VITE_BASE_PATH;
@@ -13,6 +14,12 @@ export default defineConfig(() => {
   return {
     base,
     plugins: [wasm()],
+    server: {
+      fs: {
+        // Allow local linked polyglot SDK files (including its WASM) in dev.
+        allow: [process.cwd(), path.resolve(process.cwd(), '../polyglot')],
+      },
+    },
     build: {
       // Polyglot's ESM bundle uses top-level await, so we target modern browsers.
       target: 'esnext',

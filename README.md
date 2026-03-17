@@ -51,6 +51,70 @@ npm run build
 npm run preview
 ```
 
+## Local Polyglot SDK
+
+This workspace is currently pinned to a local SDK checkout:
+
+- `@polyglot-sql/sdk` -> `file:../polyglot/packages/sdk`
+
+That means transpilation changes in `/home/wavy/ai/polyglot/packages/sdk` can be exercised directly in this app.
+
+## Headless CLI Testing
+
+You can drive the in-browser xterm session entirely from the terminal (no manual UI clicking required).
+
+Start app dev server:
+
+```bash
+npm run dev -- --host 127.0.0.1 --port 5186
+```
+
+Run a SQL script through a headless browser session:
+
+```bash
+npm run cli:headless -- --url http://127.0.0.1:5186/ --script ./my-script.sql
+```
+
+Run one-off text input:
+
+```bash
+npm run cli:headless -- --url http://127.0.0.1:5186/ --eval "SELECT 1 AS ok;\nGO\n"
+```
+
+Interactive CLI mode:
+
+```bash
+npm run cli:headless -- --url http://127.0.0.1:5186/
+```
+
+Interactive local commands:
+
+- `/help`: Show local CLI commands.
+- `/show`: Print full transcript snapshot.
+- `/wipe`: Send `WIPE` to clear runtime + IndexedDB state.
+- `/exit`: Exit headless CLI.
+
+## SQL Server Compatibility Sweep
+
+There is a side-by-side checker that runs the same sqlcmd script against:
+
+- `sqlcmd-wasm` (headless browser)
+- real SQL Server (`docker exec ... sqlcmd`)
+
+Run:
+
+```bash
+npm run compat:check -- --url http://127.0.0.1:5186/
+```
+
+The checker compares:
+
+- `Msg` error codes
+- `rows affected` sequences
+- deterministic `CASE_*` output tokens
+
+Raw logs are written under `.tmp/compat-check/` (or your `--output-dir`).
+
 ## Persistence
 
 Session state is automatically journaled in browser `IndexedDB` and restored on reload.
@@ -129,7 +193,7 @@ When `sql`, `sql64`, and `sqlUrl`/`sqlFile` are mixed, they are loaded in URL qu
 - `RESET`: Clear statement cache.
 - `WIPE` / `RESET ALL`: Clear in-memory DB, active context, and IndexedDB journal.
 - `QUIT` / `EXIT`: Terminate session input.
-- `:setvar <name> "value"`: Set scripting variable.
+- `:setvar <name> value|"value"`: Set scripting variable.
 - `:listvar`: List all variables.
 - `$(VariableName)`: Expand variable in SQL before transpilation.
 - `:r [filename]`: Browser-native file import into current batch.
