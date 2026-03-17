@@ -51,6 +51,41 @@ npm run build
 npm run preview
 ```
 
+## URL-Driven Startup
+
+You can deep-link into a prepared session by passing query parameters.
+
+- `sql`: Preload SQL text into the statement buffer. You can repeat this parameter.
+- `sql64`: Preload SQL via URL-safe base64 (useful for multi-line or quote-heavy SQL).
+- `sqlUrl` / `sqlFile`: Fetch SQL text from a URL/path and preload it into the statement buffer.
+- `run` / `autorun`: Auto-execute preloaded SQL (`true/false`, `yes/no`, `1/0`).
+- `go`: Auto-run repeat count (`go=3` means execute preloaded batch 3 times).
+- `setvar`: Set sqlcmd variables at startup (`setvar=Name=value` or `setvar=Name:value`).
+- `var.<Name>`: Alternative variable syntax (`var.TableName=Users`).
+- `onError` / `on_error`: Set startup `:On Error` mode (`exit` or `ignore`).
+- `db`: Load a startup database file or SQL script URL before prompt is shown.
+- `dbType`: Optional override for `db` type (`binary` or `sql`).
+- `init` / `initSql`: Load and execute an additional SQLite SQL script after `db`.
+
+`db`/`init` URLs can be relative paths. For static assets, put files in `public/`.
+
+Example links:
+
+```text
+/?sql=SELECT%201%20AS%20hello;
+/?sql=CREATE%20TABLE%20demo(id%20INT);&sql=INSERT%20INTO%20demo%20VALUES%20(1);&run=1
+/?db=./db/startup.sqlite&sql=SELECT%20name%20FROM%20users%20ORDER%20BY%20id;&run=true
+/?db=./bootstrap/sample.sql&dbType=sql&sql=SELECT%20label%20FROM%20startup_demo%20ORDER%20BY%20id;&go=2
+/?db=./db/startup.sqlite&init=./bootstrap/sample.sql&sql=SELECT%20COUNT(*)%20FROM%20startup_demo;&autorun=yes
+/?setvar=TableName=users&sql=SELECT%20*%20FROM%20$(TableName);&run=true
+/?var.TableName=users&var.MinId=1&sql=SELECT%20*%20FROM%20$(TableName)%20WHERE%20id%20%3E=%20$(MinId);
+/?sqlUrl=./bootstrap/sample.sql&sql=SELECT%20COUNT(*)%20AS%20total%20FROM%20startup_demo;&run=true
+/?onError=exit&sql=SELECT%20*%20FROM%20does_not_exist;&run=true
+```
+
+A valid `go` value implies auto-run when `run`/`autorun` is not explicitly set. Invalid `go` values are ignored with a startup notice.
+When `sql`, `sql64`, and `sqlUrl`/`sqlFile` are mixed, they are loaded in URL query order.
+
 ## Example Session
 
 ```text

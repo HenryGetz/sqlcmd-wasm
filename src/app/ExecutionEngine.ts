@@ -1,5 +1,5 @@
 import { Dialect, transpile } from '@polyglot-sql/sdk';
-import initSqlJs, { type Database, type Statement } from 'sql.js';
+import initSqlJs, { type Database, type SqlJsStatic, type Statement } from 'sql.js';
 import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
 
 import type { BatchExecutionResult, QueryResultSet } from './types';
@@ -18,11 +18,31 @@ interface SingleRunFailure {
 
 type SingleRunResult = SingleRunSuccess | SingleRunFailure;
 
+interface SqliteScriptExecutionSuccess {
+  ok: true;
+  rowsAffected: number;
+}
+
+interface SqliteScriptExecutionFailure {
+  ok: false;
+  rawError: string;
+  lineNumber: number;
+}
+
+type SqliteScriptExecutionResult = SqliteScriptExecutionSuccess | SqliteScriptExecutionFailure;
+
 /**
  * Owns transpilation + SQLite execution responsibilities.
  */
 export class ExecutionEngine {
-  private constructor(private readonly db: Database) {}
+  private db: Database;
+
+  private constructor(
+    private readonly sqlModule: SqlJsStatic,
+    database: Database,
+  ) {
+    this.db = database;
+  }
 
   /**
    * Create and initialize the in-browser SQLite instance.
@@ -33,7 +53,62 @@ export class ExecutionEngine {
     });
 
     const db = new SQL.Database();
-    return new ExecutionEngine(db);
+    return new ExecutionEngine(SQL, db);
+  }
+
+  /**
+   * Replace the active in-memory database with an externally provided SQLite file.
+   */
+  public loadDatabaseFromBytes(databaseBytes: Uint8Array): void {
+    const nextDatabase = new this.sqlModule.Database(databaseBytes);
+
+    this.db.close();
+    this.db = nextDatabase;
+  }
+
+  /**
+   * Execute SQLite-native bootstrap SQL (no transpilation) for startup seeding.
+   */
+  public executeSqliteScript(sqlScript: string): SqliteScriptExecutionResult {
+    if (sqlScript.trim().length === 0) {
+      return {
+        ok: true,
+        rowsAffected: 0,
+      };
+    }
+
+    const sourceStatementStartLines = this.computeSourceStatementStartLines(sqlScript);
+    let dmlRowsAffected = 0;
+    let fallbackLine = sourceStatementStartLines[0] ?? 1;
+    let statementIndex = 0;
+
+    try {
+      const statementIterator = this.db.iterateStatements(sqlScript);
+
+      for (const statement of statementIterator) {
+        fallbackLine = sourceStatementStartLines[statementIndex] ?? fallbackLine;
+        statementIndex += 1;
+
+        const statementOutcome = this.executeStatement(statement);
+
+        if (statementOutcome.rowsModified > 0) {
+          dmlRowsAffected += statementOutcome.rowsModified;
+        }
+      }
+
+      return {
+        ok: true,
+        rowsAffected: dmlRowsAffected,
+      };
+    } catch (error) {
+      const rawError = this.extractErrorMessage(error);
+
+      return {
+        ok: false,
+        rawError,
+        lineNumber: this.extractLineNumberFromMessage(rawError) ?? fallbackLine,
+      };
+    }
   }
 
   /**

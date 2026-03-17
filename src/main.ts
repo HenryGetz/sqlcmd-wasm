@@ -5,6 +5,7 @@ import { CommandParser } from './app/CommandParser';
 import { ExecutionEngine } from './app/ExecutionEngine';
 import { SqlCmdSession } from './app/SqlCmdSession';
 import { TerminalUI } from './app/TerminalUI';
+import { parseUrlStartupOptions } from './app/UrlStartupOptions';
 
 /**
  * Application bootstrap.
@@ -36,9 +37,10 @@ async function bootstrap(): Promise<void> {
 
   const commandParser = new CommandParser();
   const executionEngine = await ExecutionEngine.initialize();
+  const startupOptions = parseUrlStartupOptions(window.location.search);
 
-  const session = new SqlCmdSession(terminalUi, commandParser, executionEngine);
-  session.start();
+  const session = new SqlCmdSession(terminalUi, commandParser, executionEngine, startupOptions);
+  await session.start();
 }
 
 bootstrap().catch((error: unknown) => {

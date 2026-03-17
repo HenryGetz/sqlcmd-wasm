@@ -2,6 +2,12 @@ import { CommandParser } from './CommandParser';
 import { ErrorFormatter } from './ErrorFormatter';
 import { ExecutionEngine } from './ExecutionEngine';
 import { TerminalUI } from './TerminalUI';
+import type {
+  StartupDatabaseType,
+  StartupSqlInput,
+  StartupVariableAssignment,
+  UrlStartupOptions,
+} from './UrlStartupOptions';
 import { formatResultSetAsAsciiTable } from './formatters/tableFormatter';
 import type { OnErrorMode } from './types';
 
@@ -13,6 +19,7 @@ export class SqlCmdSession {
   private isDisconnected = false;
   private isExecuting = false;
   private isLoadingFile = false;
+  private isBootstrapping = false;
   private onErrorMode: OnErrorMode = 'ignore';
 
   private readonly errorFormatter = new ErrorFormatter('WasmSQL');
@@ -21,12 +28,13 @@ export class SqlCmdSession {
     private readonly terminalUi: TerminalUI,
     private readonly parser: CommandParser,
     private readonly engine: ExecutionEngine,
+    private readonly startupOptions: UrlStartupOptions,
   ) {}
 
   /**
    * Show intro banner and start accepting terminal lines.
    */
-  public start(): void {
+  public async start(): Promise<void> {
     this.terminalUi.writeLine('Microslop (R) SQL Server Command Line Tool');
     this.terminalUi.writeLine('Version 42.0.69.WASM NT');
     this.terminalUi.writeLine(
@@ -39,7 +47,254 @@ export class SqlCmdSession {
       await this.handleLine(line);
     });
 
-    this.renderCurrentPrompt();
+    const alreadyRenderedPrompt = await this.applyUrlStartupOptions();
+
+    if (!alreadyRenderedPrompt) {
+      this.renderCurrentPrompt();
+    }
+  }
+
+  private async applyUrlStartupOptions(): Promise<boolean> {
+    for (const notice of this.startupOptions.notices) {
+      this.terminalUi.writeInfo(`Startup: ${notice}`);
+    }
+
+    if (this.startupOptions.startupOnErrorMode) {
+      this.onErrorMode = this.startupOptions.startupOnErrorMode;
+      this.terminalUi.writeInfo(`Startup: :On Error mode set to ${this.onErrorMode.toUpperCase()}.`);
+    }
+
+    const hasStartupActions =
+      this.startupOptions.databaseSource !== null ||
+      this.startupOptions.initScriptSource !== null ||
+      this.startupOptions.sqlInputs.length > 0 ||
+      this.startupOptions.startupVariables.length > 0 ||
+      this.startupOptions.autoRun;
+
+    if (!hasStartupActions) {
+      return false;
+    }
+
+    this.isBootstrapping = true;
+    this.terminalUi.setInputEnabled(false);
+
+    try {
+      if (this.startupOptions.databaseSource) {
+        await this.loadStartupDatabase(
+          this.startupOptions.databaseSource,
+          this.startupOptions.databaseType,
+        );
+
+        if (this.isDisconnected) {
+          return true;
+        }
+      }
+
+      if (this.startupOptions.initScriptSource) {
+        await this.loadAndExecuteStartupSqlScript(this.startupOptions.initScriptSource, 'init');
+
+        if (this.isDisconnected) {
+          return true;
+        }
+      }
+
+      if (this.startupOptions.startupVariables.length > 0) {
+        this.applyStartupVariableAssignments(this.startupOptions.startupVariables);
+
+        if (this.isDisconnected) {
+          return true;
+        }
+      }
+
+      if (this.startupOptions.sqlInputs.length > 0) {
+        let totalPreloadedSqlLines = 0;
+
+        for (const sqlInput of this.startupOptions.sqlInputs) {
+          totalPreloadedSqlLines += await this.preloadStartupSqlInput(sqlInput);
+
+          if (this.isDisconnected) {
+            return true;
+          }
+        }
+
+        this.terminalUi.writeInfo(
+          `Startup: Preloaded ${totalPreloadedSqlLines} ${
+            totalPreloadedSqlLines === 1 ? 'line' : 'lines'
+          } of SQL from URL parameters.`,
+        );
+      }
+
+      if (this.startupOptions.autoRun) {
+        const hasExecutableSql = this.bufferLines.join('\n').trim().length > 0;
+
+        if (!hasExecutableSql) {
+          this.terminalUi.writeInfo('Startup: Auto-run requested, but there is no SQL batch to execute.');
+          return false;
+        }
+
+        this.terminalUi.writeInfo(
+          `Startup: Executing preloaded SQL automatically (GO ${this.startupOptions.autoRunCount}).`,
+        );
+        await this.executeBufferedBatch(this.startupOptions.autoRunCount);
+        return true;
+      }
+
+      return false;
+    } finally {
+      this.isBootstrapping = false;
+
+      if (!this.isDisconnected) {
+        this.terminalUi.setInputEnabled(true);
+      }
+    }
+  }
+
+  private applyStartupVariableAssignments(assignments: StartupVariableAssignment[]): void {
+    for (const assignment of assignments) {
+      this.parser.setVariable(assignment.name, assignment.value);
+    }
+
+    const assignedVariableNames = assignments.map((assignment) => assignment.name);
+    const uniqueNames = [...new Set(assignedVariableNames)];
+    const duplicateCount = assignedVariableNames.length - uniqueNames.length;
+
+    this.terminalUi.writeInfo(
+      `Startup: Assigned ${assignments.length} variable ${assignments.length === 1 ? 'value' : 'values'} via URL (${uniqueNames.join(', ')}${duplicateCount > 0 ? `, ${duplicateCount} override${duplicateCount === 1 ? '' : 's'}` : ''}).`,
+    );
+  }
+
+  private async preloadStartupSqlInput(sqlInput: StartupSqlInput): Promise<number> {
+    if (sqlInput.kind === 'inline') {
+      return this.appendImportedTextToStatementCache(sqlInput.text);
+    }
+
+    return this.loadStartupSqlFromUrlToBuffer(sqlInput.source, sqlInput.parameter);
+  }
+
+  private async loadStartupSqlFromUrlToBuffer(
+    requestedSource: string,
+    parameter: 'sqlUrl' | 'sqlFile',
+  ): Promise<number> {
+    this.terminalUi.writeInfo(`Startup: Loading SQL from ${parameter}=${requestedSource} ...`);
+
+    try {
+      const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
+      const sqlText = await this.fetchStartupResourceText(resolvedUrl);
+      const loadedLineCount = this.appendImportedTextToStatementCache(sqlText);
+
+      this.terminalUi.writeInfo(
+        `Startup: Loaded ${loadedLineCount} ${loadedLineCount === 1 ? 'line' : 'lines'} from ${requestedSource}.`,
+      );
+
+      return loadedLineCount;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.reportClientError(`Startup SQL preload failed (${parameter}): ${message}`, 1);
+      return 0;
+    }
+  }
+
+  private async loadStartupDatabase(
+    requestedSource: string,
+    requestedType: StartupDatabaseType | null,
+  ): Promise<void> {
+    const inferredType = requestedType ?? this.inferStartupDatabaseType(requestedSource);
+
+    if (inferredType === 'sql') {
+      await this.loadAndExecuteStartupSqlScript(requestedSource, 'db');
+      return;
+    }
+
+    this.terminalUi.writeInfo(`Startup: Loading SQLite database from ${requestedSource} ...`);
+
+    try {
+      const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
+      const bytes = await this.fetchStartupResourceBytes(resolvedUrl);
+      this.engine.loadDatabaseFromBytes(bytes);
+      this.terminalUi.writeInfo(
+        `Startup: Loaded SQLite database from ${requestedSource} (${bytes.byteLength} bytes).`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.reportClientError(`Startup database load failed: ${message}`, 1);
+    }
+  }
+
+  private async loadAndExecuteStartupSqlScript(
+    requestedSource: string,
+    sourceKind: 'db' | 'init',
+  ): Promise<void> {
+    this.terminalUi.writeInfo(`Startup: Loading SQLite SQL script from ${requestedSource} ...`);
+
+    try {
+      const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
+      const scriptText = await this.fetchStartupResourceText(resolvedUrl);
+      const executionResult = this.engine.executeSqliteScript(scriptText);
+
+      if (!executionResult.ok) {
+        this.reportClientError(
+          `Startup SQL script failed (${sourceKind}): ${executionResult.rawError}`,
+          executionResult.lineNumber,
+        );
+        return;
+      }
+
+      this.terminalUi.writeInfo(
+        `Startup: Executed SQLite SQL script from ${requestedSource} (${executionResult.rowsAffected} rows affected).`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.reportClientError(`Startup SQL script load failed: ${message}`, 1);
+    }
+  }
+
+  private resolveStartupResourceUrl(requestedSource: string): string {
+    return new URL(requestedSource, window.location.href).toString();
+  }
+
+  private inferStartupDatabaseType(requestedSource: string): StartupDatabaseType {
+    const normalizedPath = requestedSource.split('?')[0].split('#')[0].toLowerCase();
+
+    if (normalizedPath.endsWith('.sql') || normalizedPath.endsWith('.txt')) {
+      return 'sql';
+    }
+
+    return 'binary';
+  }
+
+  private async fetchStartupResourceBytes(resourceUrl: string): Promise<Uint8Array> {
+    const response = await fetch(resourceUrl);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} while requesting ${resourceUrl}`);
+    }
+
+    const buffer = await response.arrayBuffer();
+    return new Uint8Array(buffer);
+  }
+
+  private async fetchStartupResourceText(resourceUrl: string): Promise<string> {
+    const response = await fetch(resourceUrl);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} while requesting ${resourceUrl}`);
+    }
+
+    const text = await response.text();
+
+    if (this.looksLikeHtmlDocument(text)) {
+      throw new Error(
+        `Expected SQL text but received HTML from ${resourceUrl}. Check the path and static file mapping.`,
+      );
+    }
+
+    return text;
+  }
+
+  private looksLikeHtmlDocument(text: string): boolean {
+    const normalizedPrefix = text.slice(0, 512).trimStart().toLowerCase();
+
+    return normalizedPrefix.startsWith('<!doctype html') || normalizedPrefix.startsWith('<html');
   }
 
   private async handleLine(line: string): Promise<void> {
@@ -47,7 +302,7 @@ export class SqlCmdSession {
       return;
     }
 
-    if (this.isExecuting || this.isLoadingFile) {
+    if (this.isExecuting || this.isLoadingFile || this.isBootstrapping) {
       this.reportClientError('Execution already in progress. Please wait...', this.getCurrentBufferLine());
       this.renderPromptIfActive();
       return;
