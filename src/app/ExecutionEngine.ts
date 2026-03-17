@@ -62,6 +62,16 @@ export class ExecutionEngine {
   public loadDatabaseFromBytes(databaseBytes: Uint8Array): void {
     const nextDatabase = new this.sqlModule.Database(databaseBytes);
 
+    try {
+      // Validate payload before swapping so fallback HTML/garbage bytes do not
+      // poison the active session database.
+      nextDatabase.exec('PRAGMA schema_version;');
+    } catch (error) {
+      nextDatabase.close();
+      const details = this.extractErrorMessage(error);
+      throw new Error(`Invalid SQLite database payload: ${details}`);
+    }
+
     this.db.close();
     this.db = nextDatabase;
   }
