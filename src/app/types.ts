@@ -6,8 +6,10 @@ export type ParsedLineAction =
   | { kind: 'go'; count: number }
   | { kind: 'read-file'; requestedPath: string | null }
   | { kind: 'help'; topic: string | null }
+  | { kind: 'intro' }
   | { kind: 'on-error'; mode: OnErrorMode }
   | { kind: 'clear-screen' }
+  | { kind: 'wipe-state' }
   | { kind: 'reset' }
   | { kind: 'exit' }
   | { kind: 'setvar'; name: string; value: string }
@@ -43,6 +45,7 @@ export interface BatchExecutionSuccess {
   translatedSql: string;
   resultSets: QueryResultSet[];
   rowsAffected: number;
+  stateChanged: boolean;
 }
 
 /**

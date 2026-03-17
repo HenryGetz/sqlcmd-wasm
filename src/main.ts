@@ -3,6 +3,7 @@ import 'xterm/css/xterm.css';
 import './styles.css';
 import { CommandParser } from './app/CommandParser';
 import { ExecutionEngine } from './app/ExecutionEngine';
+import { PersistenceStore } from './app/PersistenceStore';
 import { SqlCmdSession } from './app/SqlCmdSession';
 import { TerminalUI } from './app/TerminalUI';
 import { parseUrlStartupOptions } from './app/UrlStartupOptions';
@@ -37,9 +38,22 @@ async function bootstrap(): Promise<void> {
 
   const commandParser = new CommandParser();
   const executionEngine = await ExecutionEngine.initialize();
+  const persistenceStore = new PersistenceStore();
   const startupOptions = parseUrlStartupOptions(window.location.search);
 
-  const session = new SqlCmdSession(terminalUi, commandParser, executionEngine, startupOptions);
+  const session = new SqlCmdSession(
+    terminalUi,
+    commandParser,
+    executionEngine,
+    startupOptions,
+    persistenceStore,
+  );
+
+  if (import.meta.env.DEV) {
+    (window as Window & { __sqlcmdSession?: SqlCmdSession }).__sqlcmdSession =
+      session;
+  }
+
   await session.start();
 }
 

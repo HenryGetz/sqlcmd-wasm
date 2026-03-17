@@ -8,6 +8,7 @@ interface SingleRunSuccess {
   ok: true;
   resultSets: QueryResultSet[];
   rowsAffected: number;
+  stateChanged: boolean;
 }
 
 interface SingleRunFailure {
@@ -71,6 +72,16 @@ export class ExecutionEngine {
       const details = this.extractErrorMessage(error);
       throw new Error(`Invalid SQLite database payload: ${details}`);
     }
+
+    this.db.close();
+    this.db = nextDatabase;
+  }
+
+  /**
+   * Reset to a fresh empty main database and detach any attached schemas.
+   */
+  public resetDatabase(): void {
+    const nextDatabase = new this.sqlModule.Database();
 
     this.db.close();
     this.db = nextDatabase;
@@ -212,6 +223,7 @@ export class ExecutionEngine {
     }
     const allResultSets: QueryResultSet[] = [];
     let totalRowsAffected = 0;
+    let stateChanged = false;
 
     for (let iteration = 1; iteration <= repeatCount; iteration += 1) {
       const runResult = this.executeTranslatedBatch(translatedStatements, sourceStatementStartLines);
@@ -229,6 +241,7 @@ export class ExecutionEngine {
 
       allResultSets.push(...runResult.resultSets);
       totalRowsAffected += runResult.rowsAffected;
+      stateChanged = stateChanged || runResult.stateChanged;
     }
 
     return {
@@ -236,6 +249,7 @@ export class ExecutionEngine {
       translatedSql,
       resultSets: allResultSets,
       rowsAffected: totalRowsAffected,
+      stateChanged,
     };
   }
 
@@ -248,10 +262,12 @@ export class ExecutionEngine {
   ): SingleRunResult {
     const resultSets: QueryResultSet[] = [];
     let dmlRowsAffected = 0;
+    let stateChanged = false;
 
     for (let statementIndex = 0; statementIndex < translatedStatements.length; statementIndex += 1) {
       const statementSql = translatedStatements[statementIndex];
       const fallbackLine = sourceStatementStartLines[statementIndex] ?? 1;
+      const isReadOnlyStatement = this.isLikelyReadOnlyStatement(statementSql);
 
       try {
         const statementIterator = this.db.iterateStatements(statementSql);
@@ -269,6 +285,10 @@ export class ExecutionEngine {
           if (statementOutcome.rowsModified > 0) {
             dmlRowsAffected += statementOutcome.rowsModified;
           }
+        }
+
+        if (!isReadOnlyStatement) {
+          stateChanged = true;
         }
       } catch (error) {
         const rawError = this.extractErrorMessage(error);
@@ -288,6 +308,7 @@ export class ExecutionEngine {
       resultSets,
       // sqlcmd commonly reports returned rows for SELECT-only runs.
       rowsAffected: selectedRows > 0 ? selectedRows : dmlRowsAffected,
+      stateChanged,
     };
   }
 
@@ -353,6 +374,18 @@ export class ExecutionEngine {
         /(\b[A-Za-z]+(?:\([^)]*\))?)\s+FOREIGN\s+KEY\s+REFERENCES\b/gi,
         '$1 REFERENCES',
       );
+  }
+
+  private isLikelyReadOnlyStatement(statementSql: string): boolean {
+    const firstKeywordMatch = statementSql.trimStart().match(/^([A-Za-z]+)/);
+
+    if (!firstKeywordMatch) {
+      return true;
+    }
+
+    const keyword = firstKeywordMatch[1].toUpperCase();
+
+    return keyword === 'SELECT' || keyword === 'PRAGMA' || keyword === 'EXPLAIN';
   }
 
   /**

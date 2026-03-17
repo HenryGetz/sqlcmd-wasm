@@ -1,13 +1,17 @@
-import { CommandParser } from './CommandParser';
+import type { CommandParser } from './CommandParser';
 import { ErrorFormatter } from './ErrorFormatter';
-import { ExecutionEngine } from './ExecutionEngine';
-import { TerminalUI } from './TerminalUI';
+import type { ExecutionEngine } from './ExecutionEngine';
+import type { TerminalUI } from './TerminalUI';
 import type {
   StartupDatabaseType,
   StartupSqlInput,
   StartupVariableAssignment,
   UrlStartupOptions,
 } from './UrlStartupOptions';
+import {
+  type PersistedSessionOperation,
+  PersistenceStore,
+} from './PersistenceStore';
 import { formatResultSetAsAsciiTable } from './formatters/tableFormatter';
 import type { OnErrorMode } from './types';
 
@@ -50,6 +54,8 @@ export class SqlCmdSession {
   private isBootstrapping = false;
   private onErrorMode: OnErrorMode = 'ignore';
   private activeDatabaseAlias: string | null = null;
+  private isReplayingPersistedOperations = false;
+  private persistenceWritesDisabled = false;
 
   private readonly errorFormatter = new ErrorFormatter('WasmSQL');
 
@@ -58,6 +64,7 @@ export class SqlCmdSession {
     private readonly parser: CommandParser,
     private readonly engine: ExecutionEngine,
     private readonly startupOptions: UrlStartupOptions,
+    private readonly persistenceStore: PersistenceStore,
   ) {}
 
   /**
@@ -70,17 +77,136 @@ export class SqlCmdSession {
       'Copyright (C) 2026 Microslop Corporation. All rights (and your data) reserved.',
     );
     this.terminalUi.writeLine();
-    this.terminalUi.writeLine('Type GO to execute batch, RESET to clear cache, and QUIT/EXIT to disconnect.');
+    this.terminalUi.writeLine(
+      'Type SQL statements, then GO. Type :Help for help (:Intro for quick start).',
+    );
 
     this.terminalUi.onLine(async (line) => {
       await this.handleLine(line);
     });
+
+    await this.restorePersistedOperations();
 
     const alreadyRenderedPrompt = await this.applyUrlStartupOptions();
 
     if (!alreadyRenderedPrompt) {
       this.renderCurrentPrompt();
     }
+  }
+
+  private async restorePersistedOperations(): Promise<void> {
+    let operations: PersistedSessionOperation[];
+
+    try {
+      operations = await this.persistenceStore.listOperations();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.terminalUi.writeInfo(
+        `Persistence: Unable to read IndexedDB journal (${message}).`,
+      );
+      return;
+    }
+
+    if (operations.length === 0) {
+      return;
+    }
+
+    this.terminalUi.writeInfo(
+      `Persistence: Restoring ${operations.length} operation${operations.length === 1 ? '' : 's'} from IndexedDB...`,
+    );
+
+    this.isReplayingPersistedOperations = true;
+
+    try {
+      for (const operation of operations) {
+        const restored = await this.replayPersistedOperation(operation);
+
+        if (!restored) {
+          this.terminalUi.writeError(
+            'Persistence: Restore stopped after an operation failed. Use WIPE to clear persisted state.',
+          );
+          return;
+        }
+      }
+    } finally {
+      this.isReplayingPersistedOperations = false;
+    }
+
+    this.terminalUi.writeInfo('Persistence: Restore complete.');
+  }
+
+  private async replayPersistedOperation(
+    operation: PersistedSessionOperation,
+  ): Promise<boolean> {
+    if (operation.kind === 'create-database') {
+      return this.executeCreateDatabaseDirective(
+        operation.databaseName,
+        1,
+        false,
+      );
+    }
+
+    if (operation.kind === 'use-database') {
+      return this.executeUseDatabaseDirective(operation.databaseName, 1, false);
+    }
+
+    if (operation.kind === 'drop-database') {
+      return this.executeDropDatabaseDirective(
+        operation.databaseName,
+        1,
+        false,
+      );
+    }
+
+    const executionResult = this.engine.executeBatch(
+      operation.sql,
+      operation.repeatCount,
+    );
+
+    if (!executionResult.ok) {
+      this.reportExecutionFailure(executionResult);
+      return false;
+    }
+
+    return true;
+  }
+
+  private async persistOperation(
+    operation: PersistedSessionOperation,
+  ): Promise<void> {
+    if (this.isReplayingPersistedOperations || this.persistenceWritesDisabled) {
+      return;
+    }
+
+    try {
+      await this.persistenceStore.appendOperation(operation);
+    } catch (error) {
+      this.persistenceWritesDisabled = true;
+      const message = error instanceof Error ? error.message : String(error);
+      this.terminalUi.writeInfo(`Persistence: Autosave disabled (${message}).`);
+    }
+  }
+
+  private async wipeSessionState(): Promise<void> {
+    this.bufferLines.length = 0;
+    this.activeDatabaseAlias = null;
+    this.engine.resetDatabase();
+
+    try {
+      await this.persistenceStore.clearOperations();
+      this.persistenceWritesDisabled = false;
+      this.terminalUi.writeInfo(
+        'Session wiped: cleared in-memory database, buffer, and IndexedDB journal.',
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.reportClientError(
+        `Session wiped in memory, but failed to clear IndexedDB journal: ${message}`,
+        1,
+      );
+    }
+
+    this.renderPromptIfActive();
   }
 
   private async applyUrlStartupOptions(): Promise<boolean> {
@@ -90,7 +216,9 @@ export class SqlCmdSession {
 
     if (this.startupOptions.startupOnErrorMode) {
       this.onErrorMode = this.startupOptions.startupOnErrorMode;
-      this.terminalUi.writeInfo(`Startup: :On Error mode set to ${this.onErrorMode.toUpperCase()}.`);
+      this.terminalUi.writeInfo(
+        `Startup: :On Error mode set to ${this.onErrorMode.toUpperCase()}.`,
+      );
     }
 
     const hasStartupActions =
@@ -120,7 +248,10 @@ export class SqlCmdSession {
       }
 
       if (this.startupOptions.initScriptSource) {
-        await this.loadAndExecuteStartupSqlScript(this.startupOptions.initScriptSource, 'init');
+        await this.loadAndExecuteStartupSqlScript(
+          this.startupOptions.initScriptSource,
+          'init',
+        );
 
         if (this.isDisconnected) {
           return true;
@@ -128,7 +259,9 @@ export class SqlCmdSession {
       }
 
       if (this.startupOptions.startupVariables.length > 0) {
-        this.applyStartupVariableAssignments(this.startupOptions.startupVariables);
+        this.applyStartupVariableAssignments(
+          this.startupOptions.startupVariables,
+        );
 
         if (this.isDisconnected) {
           return true;
@@ -157,7 +290,9 @@ export class SqlCmdSession {
         const hasExecutableSql = this.bufferLines.join('\n').trim().length > 0;
 
         if (!hasExecutableSql) {
-          this.terminalUi.writeInfo('Startup: Auto-run requested, but there is no SQL batch to execute.');
+          this.terminalUi.writeInfo(
+            'Startup: Auto-run requested, but there is no SQL batch to execute.',
+          );
           return false;
         }
 
@@ -178,12 +313,16 @@ export class SqlCmdSession {
     }
   }
 
-  private applyStartupVariableAssignments(assignments: StartupVariableAssignment[]): void {
+  private applyStartupVariableAssignments(
+    assignments: StartupVariableAssignment[],
+  ): void {
     for (const assignment of assignments) {
       this.parser.setVariable(assignment.name, assignment.value);
     }
 
-    const assignedVariableNames = assignments.map((assignment) => assignment.name);
+    const assignedVariableNames = assignments.map(
+      (assignment) => assignment.name,
+    );
     const uniqueNames = [...new Set(assignedVariableNames)];
     const duplicateCount = assignedVariableNames.length - uniqueNames.length;
 
@@ -192,19 +331,26 @@ export class SqlCmdSession {
     );
   }
 
-  private async preloadStartupSqlInput(sqlInput: StartupSqlInput): Promise<number> {
+  private async preloadStartupSqlInput(
+    sqlInput: StartupSqlInput,
+  ): Promise<number> {
     if (sqlInput.kind === 'inline') {
       return this.appendImportedTextToStatementCache(sqlInput.text);
     }
 
-    return this.loadStartupSqlFromUrlToBuffer(sqlInput.source, sqlInput.parameter);
+    return this.loadStartupSqlFromUrlToBuffer(
+      sqlInput.source,
+      sqlInput.parameter,
+    );
   }
 
   private async loadStartupSqlFromUrlToBuffer(
     requestedSource: string,
     parameter: 'sqlUrl' | 'sqlFile',
   ): Promise<number> {
-    this.terminalUi.writeInfo(`Startup: Loading SQL from ${parameter}=${requestedSource} ...`);
+    this.terminalUi.writeInfo(
+      `Startup: Loading SQL from ${parameter}=${requestedSource} ...`,
+    );
 
     try {
       const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
@@ -218,7 +364,10 @@ export class SqlCmdSession {
       return loadedLineCount;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.reportClientError(`Startup SQL preload failed (${parameter}): ${message}`, 1);
+      this.reportClientError(
+        `Startup SQL preload failed (${parameter}): ${message}`,
+        1,
+      );
       return 0;
     }
   }
@@ -227,14 +376,17 @@ export class SqlCmdSession {
     requestedSource: string,
     requestedType: StartupDatabaseType | null,
   ): Promise<void> {
-    const inferredType = requestedType ?? this.inferStartupDatabaseType(requestedSource);
+    const inferredType =
+      requestedType ?? this.inferStartupDatabaseType(requestedSource);
 
     if (inferredType === 'sql') {
       await this.loadAndExecuteStartupSqlScript(requestedSource, 'db');
       return;
     }
 
-    this.terminalUi.writeInfo(`Startup: Loading SQLite database from ${requestedSource} ...`);
+    this.terminalUi.writeInfo(
+      `Startup: Loading SQLite database from ${requestedSource} ...`,
+    );
 
     try {
       const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
@@ -253,7 +405,9 @@ export class SqlCmdSession {
     requestedSource: string,
     sourceKind: 'db' | 'init',
   ): Promise<void> {
-    this.terminalUi.writeInfo(`Startup: Loading SQLite SQL script from ${requestedSource} ...`);
+    this.terminalUi.writeInfo(
+      `Startup: Loading SQLite SQL script from ${requestedSource} ...`,
+    );
 
     try {
       const resolvedUrl = this.resolveStartupResourceUrl(requestedSource);
@@ -281,8 +435,13 @@ export class SqlCmdSession {
     return new URL(requestedSource, window.location.href).toString();
   }
 
-  private inferStartupDatabaseType(requestedSource: string): StartupDatabaseType {
-    const normalizedPath = requestedSource.split('?')[0].split('#')[0].toLowerCase();
+  private inferStartupDatabaseType(
+    requestedSource: string,
+  ): StartupDatabaseType {
+    const normalizedPath = requestedSource
+      .split('?')[0]
+      .split('#')[0]
+      .toLowerCase();
 
     if (normalizedPath.endsWith('.sql') || normalizedPath.endsWith('.txt')) {
       return 'sql';
@@ -291,11 +450,15 @@ export class SqlCmdSession {
     return 'binary';
   }
 
-  private async fetchStartupResourceBytes(resourceUrl: string): Promise<Uint8Array> {
+  private async fetchStartupResourceBytes(
+    resourceUrl: string,
+  ): Promise<Uint8Array> {
     const response = await fetch(resourceUrl);
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status} while requesting ${resourceUrl}`);
+      throw new Error(
+        `HTTP ${response.status} while requesting ${resourceUrl}`,
+      );
     }
 
     const buffer = await response.arrayBuffer();
@@ -306,7 +469,9 @@ export class SqlCmdSession {
     const response = await fetch(resourceUrl);
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status} while requesting ${resourceUrl}`);
+      throw new Error(
+        `HTTP ${response.status} while requesting ${resourceUrl}`,
+      );
     }
 
     const text = await response.text();
@@ -323,7 +488,10 @@ export class SqlCmdSession {
   private looksLikeHtmlDocument(text: string): boolean {
     const normalizedPrefix = text.slice(0, 512).trimStart().toLowerCase();
 
-    return normalizedPrefix.startsWith('<!doctype html') || normalizedPrefix.startsWith('<html');
+    return (
+      normalizedPrefix.startsWith('<!doctype html') ||
+      normalizedPrefix.startsWith('<html')
+    );
   }
 
   private async handleLine(line: string): Promise<void> {
@@ -332,7 +500,10 @@ export class SqlCmdSession {
     }
 
     if (this.isExecuting || this.isLoadingFile || this.isBootstrapping) {
-      this.reportClientError('Execution already in progress. Please wait...', this.getCurrentBufferLine());
+      this.reportClientError(
+        'Execution already in progress. Please wait...',
+        this.getCurrentBufferLine(),
+      );
       this.renderPromptIfActive();
       return;
     }
@@ -353,10 +524,17 @@ export class SqlCmdSession {
         return;
       }
 
+      case 'wipe-state': {
+        await this.wipeSessionState();
+        return;
+      }
+
       case 'exit': {
         this.isDisconnected = true;
         this.terminalUi.lockInput();
-        this.terminalUi.writeInfo('Sqlcmd: session terminated. Input is now disabled.');
+        this.terminalUi.writeInfo(
+          'Sqlcmd: session terminated. Input is now disabled.',
+        );
         return;
       }
 
@@ -380,13 +558,21 @@ export class SqlCmdSession {
 
       case 'on-error': {
         this.onErrorMode = action.mode;
-        this.terminalUi.writeInfo(`:On Error mode set to ${action.mode.toUpperCase()}.`);
+        this.terminalUi.writeInfo(
+          `:On Error mode set to ${action.mode.toUpperCase()}.`,
+        );
         this.renderPromptIfActive();
         return;
       }
 
       case 'help': {
         this.renderHelpMenu(action.topic);
+        this.renderPromptIfActive();
+        return;
+      }
+
+      case 'intro': {
+        this.renderIntroTutorial();
         this.renderPromptIfActive();
         return;
       }
@@ -412,7 +598,9 @@ export class SqlCmdSession {
   /**
    * Implements a browser-native variant of sqlcmd's :r directive.
    */
-  private async handleReadFileDirective(requestedPath: string | null): Promise<void> {
+  private async handleReadFileDirective(
+    requestedPath: string | null,
+  ): Promise<void> {
     this.isLoadingFile = true;
     this.terminalUi.setInputEnabled(false);
 
@@ -426,13 +614,16 @@ export class SqlCmdSession {
       const selectedFile = await this.showFilePickerForReadDirective();
 
       if (!selectedFile) {
-        this.terminalUi.writeInfo('Microslop VFS: File import canceled by user.');
+        this.terminalUi.writeInfo(
+          'Microslop VFS: File import canceled by user.',
+        );
         this.renderPromptIfActive();
         return;
       }
 
       const fileText = await selectedFile.text();
-      const importedLineCount = this.appendImportedTextToStatementCache(fileText);
+      const importedLineCount =
+        this.appendImportedTextToStatementCache(fileText);
 
       this.terminalUi.writeInfo(
         `Microslop VFS: Successfully loaded ${importedLineCount} ${
@@ -442,7 +633,10 @@ export class SqlCmdSession {
       this.renderPromptIfActive();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.reportClientError(`Microslop VFS: Failed to import file: ${message}`, this.getCurrentBufferLine());
+      this.reportClientError(
+        `Microslop VFS: Failed to import file: ${message}`,
+        this.getCurrentBufferLine(),
+      );
       this.renderPromptIfActive();
     } finally {
       this.isLoadingFile = false;
@@ -456,7 +650,9 @@ export class SqlCmdSession {
   private async showFilePickerForReadDirective(): Promise<File | null> {
     const showOpenFilePicker = (
       window as Window & {
-        showOpenFilePicker?: (options?: unknown) => Promise<Array<{ getFile: () => Promise<File> }>>;
+        showOpenFilePicker?: (
+          options?: unknown,
+        ) => Promise<Array<{ getFile: () => Promise<File> }>>;
       }
     ).showOpenFilePicker;
 
@@ -590,7 +786,9 @@ export class SqlCmdSession {
       document.body.append(input);
 
       try {
-        const maybeShowPicker = (input as HTMLInputElement & { showPicker?: () => void }).showPicker;
+        const maybeShowPicker = (
+          input as HTMLInputElement & { showPicker?: () => void }
+        ).showPicker;
 
         if (typeof maybeShowPicker === 'function') {
           maybeShowPicker.call(input);
@@ -630,8 +828,14 @@ export class SqlCmdSession {
       return;
     }
 
-    const nameWidth = Math.max('Name'.length, ...entries.map(([name]) => name.length));
-    const valueWidth = Math.max('Value'.length, ...entries.map(([, value]) => value.length));
+    const nameWidth = Math.max(
+      'Name'.length,
+      ...entries.map(([name]) => name.length),
+    );
+    const valueWidth = Math.max(
+      'Value'.length,
+      ...entries.map(([, value]) => value.length),
+    );
 
     const separator = `+${'-'.repeat(nameWidth + 2)}+${'-'.repeat(valueWidth + 2)}+`;
     const header = `| ${'Name'.padEnd(nameWidth, ' ')} | ${'Value'.padEnd(valueWidth, ' ')} |`;
@@ -651,25 +855,88 @@ export class SqlCmdSession {
 
   private renderHelpMenu(topic: string | null): void {
     if (topic) {
-      this.terminalUi.writeInfo(`No detailed help available for '${topic}'. Showing general help.`);
+      this.terminalUi.writeInfo(
+        `No detailed help available for '${topic}'. Showing general help.`,
+      );
     }
 
     this.terminalUi.writeLine('SQLCMD Help');
     this.terminalUi.writeLine('----------');
-    this.terminalUi.writeLine('GO [count]               Execute the current statement cache.');
-    this.terminalUi.writeLine('RESET                    Clear the current statement cache.');
-    this.terminalUi.writeLine('QUIT | EXIT              Terminate the session.');
-    this.terminalUi.writeLine(':setvar Name "value"     Define a scripting variable.');
-    this.terminalUi.writeLine(':listvar                 List all scripting variables.');
-    this.terminalUi.writeLine(':r [filename]            Load a local .sql/.txt file into the cache.');
-    this.terminalUi.writeLine(':On Error [exit|ignore]  Choose whether errors end the session.');
-    this.terminalUi.writeLine(':Help                    Display this help menu.');
-    this.terminalUi.writeLine('!! cls                   Clear terminal output (like cls).');
+    this.terminalUi.writeLine(
+      'GO [count]               Execute the current statement cache.',
+    );
+    this.terminalUi.writeLine(
+      'RESET                    Clear the current statement cache.',
+    );
+    this.terminalUi.writeLine(
+      'WIPE | RESET ALL         Clear DB state + IndexedDB persistence + buffer.',
+    );
+    this.terminalUi.writeLine(
+      'QUIT | EXIT              Terminate the session.',
+    );
+    this.terminalUi.writeLine(
+      ':setvar Name "value"     Define a scripting variable.',
+    );
+    this.terminalUi.writeLine(
+      ':listvar                 List all scripting variables.',
+    );
+    this.terminalUi.writeLine(
+      ':r [filename]            Load a local .sql/.txt file into the cache.',
+    );
+    this.terminalUi.writeLine(
+      ':On Error [exit|ignore]  Choose whether errors end the session.',
+    );
+    this.terminalUi.writeLine(
+      ':Intro                   Show a first-run tutorial in sqlcmd style.',
+    );
+    this.terminalUi.writeLine(
+      ':Help                    Display this help menu.',
+    );
+    this.terminalUi.writeLine(
+      '!! cls                   Clear terminal output (like cls).',
+    );
+  }
+
+  private renderIntroTutorial(): void {
+    this.terminalUi.writeLine('SQLCMD Intro');
+    this.terminalUi.writeLine('------------');
+    this.terminalUi.writeLine('Core Flow');
+    this.terminalUi.writeLine('---------');
+    this.terminalUi.writeLine('1) Type one or more SQL lines into the current batch.');
+    this.terminalUi.writeLine('2) Type GO to execute the current batch.');
+    this.terminalUi.writeLine('3) Type GO [count] to execute the same batch multiple times.');
+    this.terminalUi.writeLine('4) Type RESET to clear pending lines without executing.');
+    this.terminalUi.writeLine();
+
+    this.terminalUi.writeLine('Useful Commands');
+    this.terminalUi.writeLine('---------------');
+    this.terminalUi.writeLine(':r [filename]            Import a local .sql/.txt file into the batch.');
+    this.terminalUi.writeLine(':setvar Name "value"     Define $(Name) variable values.');
+    this.terminalUi.writeLine(':listvar                 Show currently defined variables.');
+    this.terminalUi.writeLine(':On Error [exit|ignore]  Exit on first error, or continue.');
+    this.terminalUi.writeLine('!! cls                   Clear terminal output.');
+    this.terminalUi.writeLine('WIPE | RESET ALL         Reset DB state + persisted journal + batch.');
+    this.terminalUi.writeLine();
+
+    this.terminalUi.writeLine('Example Session');
+    this.terminalUi.writeLine('---------------');
+    this.terminalUi.writeLine('1> :setvar TableName "Users"');
+    this.terminalUi.writeLine('1> CREATE TABLE $(TableName) (Id INT, Name VARCHAR(50));');
+    this.terminalUi.writeLine('2> INSERT INTO $(TableName) VALUES (1, \'Ada\');');
+    this.terminalUi.writeLine('3> GO');
+    this.terminalUi.writeLine('1> SELECT * FROM $(TableName);');
+    this.terminalUi.writeLine('2> GO');
+    this.terminalUi.writeLine();
+
+    this.terminalUi.writeLine('Type :Help for the complete command reference.');
   }
 
   private async executeBufferedBatch(goCount: number): Promise<void> {
     if (this.bufferLines.length === 0) {
-      this.reportClientError('Batch buffer is empty. Enter SQL lines before GO.', 1);
+      this.reportClientError(
+        'Batch buffer is empty. Enter SQL lines before GO.',
+        1,
+      );
       this.renderPromptIfActive();
       return;
     }
@@ -707,32 +974,65 @@ export class SqlCmdSession {
           }
 
           if (operation.kind === 'create-database') {
-            if (!this.executeCreateDatabaseDirective(operation.databaseName, operation.lineNumber)) {
+            if (
+              !(await this.executeCreateDatabaseDirective(
+                operation.databaseName,
+                operation.lineNumber,
+              ))
+            ) {
               if (!this.isDisconnected) {
                 this.resetBufferAndPrompt();
               }
               return;
             }
+
+            await this.persistOperation({
+              kind: 'create-database',
+              databaseName: operation.databaseName,
+              createdAt: Date.now(),
+            });
             continue;
           }
 
           if (operation.kind === 'use-database') {
-            if (!this.executeUseDatabaseDirective(operation.databaseName, operation.lineNumber)) {
+            if (
+              !(await this.executeUseDatabaseDirective(
+                operation.databaseName,
+                operation.lineNumber,
+              ))
+            ) {
               if (!this.isDisconnected) {
                 this.resetBufferAndPrompt();
               }
               return;
             }
+
+            await this.persistOperation({
+              kind: 'use-database',
+              databaseName: operation.databaseName,
+              createdAt: Date.now(),
+            });
             continue;
           }
 
           if (operation.kind === 'drop-database') {
-            if (!this.executeDropDatabaseDirective(operation.databaseName, operation.lineNumber)) {
+            if (
+              !(await this.executeDropDatabaseDirective(
+                operation.databaseName,
+                operation.lineNumber,
+              ))
+            ) {
               if (!this.isDisconnected) {
                 this.resetBufferAndPrompt();
               }
               return;
             }
+
+            await this.persistOperation({
+              kind: 'drop-database',
+              databaseName: operation.databaseName,
+              createdAt: Date.now(),
+            });
             continue;
           }
 
@@ -748,6 +1048,15 @@ export class SqlCmdSession {
           allResultSets.push(...result.resultSets);
           totalRowsAffected += result.rowsAffected;
           executedSqlBatchCount += 1;
+
+          if (result.stateChanged) {
+            await this.persistOperation({
+              kind: 'sql',
+              sql: result.persistedSql,
+              repeatCount: result.repeatCount,
+              createdAt: Date.now(),
+            });
+          }
         }
       }
 
@@ -779,8 +1088,13 @@ export class SqlCmdSession {
     }
   }
 
-  private parseBufferedBatchOperations(batchSql: string): BufferedBatchOperation[] {
-    const lines = batchSql.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  private parseBufferedBatchOperations(
+    batchSql: string,
+  ): BufferedBatchOperation[] {
+    const lines = batchSql
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .split('\n');
     const operations: BufferedBatchOperation[] = [];
 
     let currentSqlLines: string[] = [];
@@ -872,7 +1186,8 @@ export class SqlCmdSession {
           operations.push({
             kind: 'invalid-directive',
             lineNumber,
-            message: 'Invalid USE target. Use a simple identifier like CoffeeShopDB.',
+            message:
+              'Invalid USE target. Use a simple identifier like CoffeeShopDB.',
           });
         } else {
           operations.push({
@@ -885,7 +1200,9 @@ export class SqlCmdSession {
         continue;
       }
 
-      const dropDatabaseMatch = trimmed.match(/^DROP\s+DATABASE\s+(.+?)\s*;?\s*(?:--.*)?$/i);
+      const dropDatabaseMatch = trimmed.match(
+        /^DROP\s+DATABASE\s+(.+?)\s*;?\s*(?:--.*)?$/i,
+      );
 
       if (dropDatabaseMatch) {
         flushCurrentSqlLines(1);
@@ -895,7 +1212,8 @@ export class SqlCmdSession {
           operations.push({
             kind: 'invalid-directive',
             lineNumber,
-            message: 'Invalid DROP DATABASE target. Use a simple identifier like CoffeeShopDB.',
+            message:
+              'Invalid DROP DATABASE target. Use a simple identifier like CoffeeShopDB.',
           });
         } else {
           operations.push({
@@ -940,9 +1258,16 @@ export class SqlCmdSession {
     return normalized;
   }
 
-  private executeCreateDatabaseDirective(databaseName: string, lineNumber: number): boolean {
+  private async executeCreateDatabaseDirective(
+    databaseName: string,
+    lineNumber: number,
+    announce = true,
+  ): Promise<boolean> {
     if (this.engine.hasAttachedDatabase(databaseName)) {
-      this.reportClientError(`Database '${databaseName}' already exists in this session.`, lineNumber);
+      this.reportClientError(
+        `Database '${databaseName}' already exists in this session.`,
+        lineNumber,
+      );
       return false;
     }
 
@@ -958,11 +1283,18 @@ export class SqlCmdSession {
       return false;
     }
 
-    this.terminalUi.writeInfo(`Database '${databaseName}' created.`);
+    if (announce) {
+      this.terminalUi.writeInfo(`Database '${databaseName}' created.`);
+    }
+
     return true;
   }
 
-  private executeUseDatabaseDirective(databaseName: string, lineNumber: number): boolean {
+  private async executeUseDatabaseDirective(
+    databaseName: string,
+    lineNumber: number,
+    announce = true,
+  ): Promise<boolean> {
     if (!this.engine.hasAttachedDatabase(databaseName)) {
       this.reportClientError(
         `Cannot USE database '${databaseName}' because it is not attached. Run CREATE DATABASE first.`,
@@ -972,17 +1304,32 @@ export class SqlCmdSession {
     }
 
     this.activeDatabaseAlias = databaseName;
-    this.terminalUi.writeInfo(`Changed database context to '${databaseName}'.`);
+
+    if (announce) {
+      this.terminalUi.writeInfo(
+        `Changed database context to '${databaseName}'.`,
+      );
+    }
+
     return true;
   }
 
-  private executeDropDatabaseDirective(databaseName: string, lineNumber: number): boolean {
+  private async executeDropDatabaseDirective(
+    databaseName: string,
+    lineNumber: number,
+    announce = true,
+  ): Promise<boolean> {
     if (!this.engine.hasAttachedDatabase(databaseName)) {
-      this.reportClientError(`Cannot DROP database '${databaseName}' because it does not exist.`, lineNumber);
+      this.reportClientError(
+        `Cannot DROP database '${databaseName}' because it does not exist.`,
+        lineNumber,
+      );
       return false;
     }
 
-    const detachResult = this.engine.executeSqliteScript(`DETACH DATABASE ${databaseName};`);
+    const detachResult = this.engine.executeSqliteScript(
+      `DETACH DATABASE ${databaseName};`,
+    );
 
     if (!detachResult.ok) {
       this.reportClientError(
@@ -996,13 +1343,21 @@ export class SqlCmdSession {
       this.activeDatabaseAlias = null;
     }
 
-    this.terminalUi.writeInfo(`Database '${databaseName}' dropped.`);
+    if (announce) {
+      this.terminalUi.writeInfo(`Database '${databaseName}' dropped.`);
+    }
+
     return true;
   }
 
-  private executeSqlOperation(operation: Extract<BufferedBatchOperation, { kind: 'sql' }>): {
+  private executeSqlOperation(
+    operation: Extract<BufferedBatchOperation, { kind: 'sql' }>,
+  ): {
     resultSets: Array<{ columns: string[]; rows: string[][] }>;
     rowsAffected: number;
+    persistedSql: string;
+    repeatCount: number;
+    stateChanged: boolean;
   } | null {
     const sqlWithContext = this.applyActiveDatabaseContext(operation.sql);
     const expansion = this.parser.expandVariables(sqlWithContext);
@@ -1015,7 +1370,10 @@ export class SqlCmdSession {
       return null;
     }
 
-    const executionResult = this.engine.executeBatch(expansion.expandedSql, operation.repeatCount);
+    const executionResult = this.engine.executeBatch(
+      expansion.expandedSql,
+      operation.repeatCount,
+    );
 
     if (!executionResult.ok) {
       this.reportExecutionFailure(executionResult);
@@ -1025,6 +1383,9 @@ export class SqlCmdSession {
     return {
       resultSets: executionResult.resultSets,
       rowsAffected: executionResult.rowsAffected,
+      persistedSql: expansion.expandedSql,
+      repeatCount: operation.repeatCount,
+      stateChanged: executionResult.stateChanged,
     };
   }
 
@@ -1096,7 +1457,9 @@ export class SqlCmdSession {
 
     this.isDisconnected = true;
     this.terminalUi.lockInput();
-    this.terminalUi.writeInfo('Sqlcmd: :On Error EXIT triggered. Session terminated.');
+    this.terminalUi.writeInfo(
+      'Sqlcmd: :On Error EXIT triggered. Session terminated.',
+    );
   }
 
   private getCurrentBufferLine(): number {

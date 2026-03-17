@@ -51,6 +51,24 @@ npm run build
 npm run preview
 ```
 
+## Persistence
+
+Session state is automatically journaled in browser `IndexedDB` and restored on reload.
+
+- Executed SQL batches are replayed in order when the page opens.
+- `CREATE DATABASE`, `USE`, and `DROP DATABASE` directives are also replayed.
+- Read-only queries (like `SELECT`) are not journaled, so diagnostics don’t bloat restore history.
+- Persistence is scoped per browser origin (for example, `localhost` and a TailNet IP keep separate journals).
+- This keeps your in-browser schema/data alive across refreshes without a backend.
+
+To fully clear state (current in-memory DB plus persisted journal), run:
+
+```text
+WIPE
+```
+
+`RESET ALL` is an alias for `WIPE`.
+
 ## URL-Driven Startup
 
 You can deep-link into a prepared session by passing query parameters.
@@ -109,12 +127,14 @@ When `sql`, `sql64`, and `sqlUrl`/`sqlFile` are mixed, they are loaded in URL qu
 
 - `GO [count]`: Execute current batch (optionally N times).
 - `RESET`: Clear statement cache.
+- `WIPE` / `RESET ALL`: Clear in-memory DB, active context, and IndexedDB journal.
 - `QUIT` / `EXIT`: Terminate session input.
 - `:setvar <name> "value"`: Set scripting variable.
 - `:listvar`: List all variables.
 - `$(VariableName)`: Expand variable in SQL before transpilation.
 - `:r [filename]`: Browser-native file import into current batch.
 - `:On Error [exit|ignore]`: Configure session behavior on errors.
+- `:Intro`: Show a first-run tutorial in sqlcmd style.
 - `:Help`: Show in-terminal help.
 - `!! cls`: Clear terminal viewport like `cls`.
 

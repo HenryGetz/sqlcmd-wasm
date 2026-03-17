@@ -19,6 +19,10 @@ export class CommandParser {
       return { kind: 'reset' };
     }
 
+    if (/^(wipe|reset\s+all)$/i.test(trimmed)) {
+      return { kind: 'wipe-state' };
+    }
+
     if (/^(quit|exit)$/i.test(trimmed)) {
       return { kind: 'exit' };
     }
@@ -43,6 +47,10 @@ export class CommandParser {
         kind: 'help',
         topic: topic && topic.length > 0 ? topic : null,
       };
+    }
+
+    if (/^:intro$/i.test(trimmed)) {
+      return { kind: 'intro' };
     }
 
     const onErrorMatch = trimmed.match(/^:on\s+error\s+(exit|ignore)$/i);
