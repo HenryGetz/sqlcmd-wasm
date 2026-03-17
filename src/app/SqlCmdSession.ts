@@ -424,14 +424,91 @@ export class SqlCmdSession {
   /**
    * Prompt the user to choose a local SQL/TXT file and resolve with the file.
    */
-  private showFilePickerForReadDirective(): Promise<File | null> {
+  private async showFilePickerForReadDirective(): Promise<File | null> {
+    const showOpenFilePicker = (
+      window as Window & {
+        showOpenFilePicker?: (options?: unknown) => Promise<Array<{ getFile: () => Promise<File> }>>;
+      }
+    ).showOpenFilePicker;
+
+    if (typeof showOpenFilePicker === 'function') {
+      try {
+        const handles = await showOpenFilePicker.call(window, {
+          multiple: false,
+          types: [
+            {
+              description: 'SQL script files',
+              accept: {
+                'text/plain': ['.sql', '.txt'],
+              },
+            },
+          ],
+        });
+
+        if (handles.length === 0) {
+          return null;
+        }
+
+        return handles[0].getFile();
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          return null;
+        }
+      }
+    }
+
+    return this.showFilePickerWithInputFallback();
+  }
+
+  private showFilePickerWithInputFallback(): Promise<File | null> {
     return new Promise((resolve) => {
       const input = document.createElement('input');
       input.type = 'file';
+      input.multiple = false;
       input.accept = '.sql,.txt';
       input.style.display = 'none';
 
       let settled = false;
+      let didLoseFocusAfterOpen = false;
+      let settleTimerId: number | null = null;
+
+      const getSelectedFile = (): File | null =>
+        input.files && input.files.length > 0 ? input.files[0] : null;
+
+      const clearSettleTimer = (): void => {
+        if (settleTimerId === null) {
+          return;
+        }
+
+        window.clearTimeout(settleTimerId);
+        settleTimerId = null;
+      };
+
+      const settleFromInputWhenStable = (maxWaitMs: number): void => {
+        clearSettleTimer();
+        const startedAt = Date.now();
+
+        const poll = (): void => {
+          if (settled) {
+            return;
+          }
+
+          const selectedFile = getSelectedFile();
+          if (selectedFile) {
+            finish(selectedFile);
+            return;
+          }
+
+          if (Date.now() - startedAt >= maxWaitMs) {
+            finish(null);
+            return;
+          }
+
+          settleTimerId = window.setTimeout(poll, 50);
+        };
+
+        settleTimerId = window.setTimeout(poll, 50);
+      };
 
       const finish = (file: File | null): void => {
         if (settled) {
@@ -444,39 +521,56 @@ export class SqlCmdSession {
       };
 
       const onChange = (): void => {
-        const file = input.files && input.files.length > 0 ? input.files[0] : null;
-        finish(file);
+        clearSettleTimer();
+        finish(getSelectedFile());
       };
 
       const onCancel = (): void => {
-        finish(null);
+        // Some browsers emit cancel before the selected file is reflected.
+        settleFromInputWhenStable(1000);
+      };
+
+      const onWindowBlur = (): void => {
+        didLoseFocusAfterOpen = true;
       };
 
       const onWindowFocus = (): void => {
-        // When the picker closes without selection, many browsers only restore focus.
-        window.setTimeout(() => {
-          if (settled) {
-            return;
-          }
+        // Only treat focus restoration as picker-close after we observed blur.
+        if (!didLoseFocusAfterOpen) {
+          return;
+        }
 
-          const file = input.files && input.files.length > 0 ? input.files[0] : null;
-          finish(file);
-        }, 0);
+        // Some browsers restore focus without change/cancel events.
+        settleFromInputWhenStable(1200);
       };
 
       const cleanup = (): void => {
+        clearSettleTimer();
         input.removeEventListener('change', onChange);
         input.removeEventListener('cancel', onCancel as EventListener);
+        window.removeEventListener('blur', onWindowBlur);
         window.removeEventListener('focus', onWindowFocus);
         input.remove();
       };
 
       input.addEventListener('change', onChange);
       input.addEventListener('cancel', onCancel as EventListener);
-      window.addEventListener('focus', onWindowFocus, { once: true });
+      window.addEventListener('blur', onWindowBlur);
+      window.addEventListener('focus', onWindowFocus);
 
       document.body.append(input);
-      input.click();
+
+      try {
+        const maybeShowPicker = (input as HTMLInputElement & { showPicker?: () => void }).showPicker;
+
+        if (typeof maybeShowPicker === 'function') {
+          maybeShowPicker.call(input);
+        } else {
+          input.click();
+        }
+      } catch {
+        input.click();
+      }
     });
   }
 
