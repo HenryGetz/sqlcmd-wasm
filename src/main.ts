@@ -23,6 +23,26 @@ declare global {
   }
 }
 
+async function registerServiceWorkerIfAvailable(): Promise<void> {
+  if (!('serviceWorker' in navigator)) {
+    return;
+  }
+
+  try {
+    const serviceWorkerPath = `${import.meta.env.BASE_URL}service-worker.js`;
+    const registration = await navigator.serviceWorker.register(serviceWorkerPath, {
+      scope: import.meta.env.BASE_URL,
+    });
+
+    // Periodically check for updated deployments while online.
+    window.setInterval(() => {
+      void registration.update();
+    }, 60_000);
+  } catch (error) {
+    console.warn('Service worker registration failed:', error);
+  }
+}
+
 /**
  * Application bootstrap.
  *
@@ -30,6 +50,8 @@ declare global {
  * architecture portable for future embedding inside BuddySQL.
  */
 async function bootstrap(): Promise<void> {
+  await registerServiceWorkerIfAvailable();
+
   const app = document.querySelector<HTMLDivElement>('#app');
 
   if (!app) {

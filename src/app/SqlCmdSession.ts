@@ -12,6 +12,7 @@ import {
   type PersistedSessionOperation,
   PersistenceStore,
 } from './PersistenceStore';
+import { mapSqlCodeSegments } from './sqlTextUtils';
 import { formatResultSetAsAsciiTable } from './formatters/tableFormatter';
 import type { OnErrorMode } from './types';
 
@@ -43,6 +44,14 @@ type BufferedBatchOperation =
       message: string;
     };
 
+interface DirectiveParseState {
+  inBlockComment: boolean;
+  inSingleQuote: boolean;
+  inDoubleQuote: boolean;
+  inBacktickQuote: boolean;
+  inBracketIdentifier: boolean;
+}
+
 /**
  * Coordinates UI input, directive handling, buffering rules, and SQL execution.
  */
@@ -59,6 +68,14 @@ export class SqlCmdSession {
   private hasStarted = false;
 
   private readonly errorFormatter = new ErrorFormatter('WasmSQL');
+
+  private readonly initialDirectiveParseState: DirectiveParseState = {
+    inBlockComment: false,
+    inSingleQuote: false,
+    inDoubleQuote: false,
+    inBacktickQuote: false,
+    inBracketIdentifier: false,
+  };
 
   public constructor(
     private readonly terminalUi: TerminalUI,
@@ -570,7 +587,7 @@ export class SqlCmdSession {
       }
 
       case 'go': {
-        if (this.isInsideOpenBlockComment(this.bufferLines)) {
+        if (this.isInsideOpenDirectiveContext(this.bufferLines)) {
           this.bufferLines.push(line);
           this.renderPromptIfActive();
           return;
@@ -1123,7 +1140,9 @@ export class SqlCmdSession {
 
     let currentSqlLines: string[] = [];
     let currentSqlStartLine = 1;
-    let insideBlockComment = false;
+    let directiveParseState: DirectiveParseState = {
+      ...this.initialDirectiveParseState,
+    };
 
     const flushCurrentSqlLines = (repeatCount: number): void => {
       if (currentSqlLines.length === 0) {
@@ -1149,10 +1168,10 @@ export class SqlCmdSession {
       const lineNumber = index + 1;
       const analyzedLine = this.analyzeLineForDirectiveParsing(
         line,
-        insideBlockComment,
+        directiveParseState,
       );
 
-      insideBlockComment = analyzedLine.endsInBlockComment;
+      directiveParseState = analyzedLine.nextState;
 
       const trimmed = analyzedLine.visibleText.trim();
 
@@ -1272,22 +1291,25 @@ export class SqlCmdSession {
 
   private analyzeLineForDirectiveParsing(
     line: string,
-    startsInBlockComment: boolean,
+    startingState: DirectiveParseState,
   ): {
     visibleText: string;
-    endsInBlockComment: boolean;
+    nextState: DirectiveParseState;
   } {
+    const state: DirectiveParseState = {
+      ...startingState,
+    };
+
     let visibleText = '';
     let index = 0;
-    let inBlockComment = startsInBlockComment;
 
     while (index < line.length) {
       const current = line[index];
       const next = line[index + 1] ?? '';
 
-      if (inBlockComment) {
+      if (state.inBlockComment) {
         if (current === '*' && next === '/') {
-          inBlockComment = false;
+          state.inBlockComment = false;
           index += 2;
           continue;
         }
@@ -1296,14 +1318,99 @@ export class SqlCmdSession {
         continue;
       }
 
-      if (current === '/' && next === '*') {
-        inBlockComment = true;
+      if (
+        !state.inSingleQuote &&
+        !state.inDoubleQuote &&
+        !state.inBacktickQuote &&
+        !state.inBracketIdentifier &&
+        current === '/' &&
+        next === '*'
+      ) {
+        state.inBlockComment = true;
         index += 2;
         continue;
       }
 
-      if (current === '-' && next === '-') {
+      if (
+        !state.inSingleQuote &&
+        !state.inDoubleQuote &&
+        !state.inBacktickQuote &&
+        !state.inBracketIdentifier &&
+        current === '-' &&
+        next === '-'
+      ) {
         break;
+      }
+
+      if (!state.inDoubleQuote && !state.inBacktickQuote && !state.inBracketIdentifier) {
+        if (current === "'" && next === "'") {
+          visibleText += current;
+          visibleText += next;
+          index += 2;
+          continue;
+        }
+
+        if (current === "'") {
+          state.inSingleQuote = !state.inSingleQuote;
+          visibleText += current;
+          index += 1;
+          continue;
+        }
+      }
+
+      if (!state.inSingleQuote && !state.inBacktickQuote && !state.inBracketIdentifier) {
+        if (current === '"' && next === '"') {
+          visibleText += current;
+          visibleText += next;
+          index += 2;
+          continue;
+        }
+
+        if (current === '"') {
+          state.inDoubleQuote = !state.inDoubleQuote;
+          visibleText += current;
+          index += 1;
+          continue;
+        }
+      }
+
+      if (!state.inSingleQuote && !state.inDoubleQuote && !state.inBracketIdentifier) {
+        if (current === '`' && next === '`') {
+          visibleText += current;
+          visibleText += next;
+          index += 2;
+          continue;
+        }
+
+        if (current === '`') {
+          state.inBacktickQuote = !state.inBacktickQuote;
+          visibleText += current;
+          index += 1;
+          continue;
+        }
+      }
+
+      if (!state.inSingleQuote && !state.inDoubleQuote && !state.inBacktickQuote) {
+        if (current === '[' && !state.inBracketIdentifier) {
+          state.inBracketIdentifier = true;
+          visibleText += current;
+          index += 1;
+          continue;
+        }
+
+        if (current === ']' && state.inBracketIdentifier) {
+          if (next === ']') {
+            visibleText += current;
+            visibleText += next;
+            index += 2;
+            continue;
+          }
+
+          state.inBracketIdentifier = false;
+          visibleText += current;
+          index += 1;
+          continue;
+        }
       }
 
       visibleText += current;
@@ -1312,19 +1419,27 @@ export class SqlCmdSession {
 
     return {
       visibleText,
-      endsInBlockComment: inBlockComment,
+      nextState: state,
     };
   }
 
-  private isInsideOpenBlockComment(lines: string[]): boolean {
-    let inBlockComment = false;
+  private isInsideOpenDirectiveContext(lines: string[]): boolean {
+    let state: DirectiveParseState = {
+      ...this.initialDirectiveParseState,
+    };
 
     for (const line of lines) {
-      const analysis = this.analyzeLineForDirectiveParsing(line, inBlockComment);
-      inBlockComment = analysis.endsInBlockComment;
+      const analysis = this.analyzeLineForDirectiveParsing(line, state);
+      state = analysis.nextState;
     }
 
-    return inBlockComment;
+    return (
+      state.inBlockComment ||
+      state.inSingleQuote ||
+      state.inDoubleQuote ||
+      state.inBacktickQuote ||
+      state.inBracketIdentifier
+    );
   }
 
   private parseDatabaseAlias(rawValue: string): string | null {
@@ -1448,8 +1563,7 @@ export class SqlCmdSession {
     repeatCount: number;
     stateChanged: boolean;
   } | null {
-    const sqlWithContext = this.applyActiveDatabaseContext(operation.sql);
-    const expansion = this.parser.expandVariables(sqlWithContext);
+    const expansion = this.parser.expandVariables(operation.sql);
 
     if (expansion.missingVariables.length > 0) {
       this.reportClientError(
@@ -1459,8 +1573,10 @@ export class SqlCmdSession {
       return null;
     }
 
+    const sqlWithContext = this.applyActiveDatabaseContext(expansion.expandedSql);
+
     const executionResult = this.engine.executeBatch(
-      expansion.expandedSql,
+      sqlWithContext,
       operation.repeatCount,
     );
 
@@ -1472,7 +1588,7 @@ export class SqlCmdSession {
     return {
       resultSets: executionResult.resultSets,
       rowsAffected: executionResult.rowsAffected,
-      persistedSql: expansion.expandedSql,
+      persistedSql: sqlWithContext,
       repeatCount: operation.repeatCount,
       stateChanged: executionResult.stateChanged,
     };
@@ -1485,17 +1601,259 @@ export class SqlCmdSession {
 
     const activeAlias = this.activeDatabaseAlias;
 
-    const qualified = sqlBatch
-      .replace(
-        /(^|[;\n]\s*)(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?![A-Za-z_][A-Za-z0-9_]*\.)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gim,
-        `$1$2${activeAlias}.$3`,
-      )
-      .replace(
-        /(\b(?:FROM|JOIN|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+)(sqlite_master|sqlite_schema)\b/gi,
-        `$1${activeAlias}.$2`,
+    return mapSqlCodeSegments(sqlBatch, (code) => {
+      let updated = code;
+      const cteNames = this.extractCteNames(code);
+
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bINSERT\s+INTO\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bUPDATE\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bDELETE\s+FROM\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bFROM\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bJOIN\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bALTER\s+TABLE\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bTRUNCATE\s+TABLE\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
+      );
+      updated = this.qualifyKeywordTarget(
+        updated,
+        /(\bREFERENCES\s+)(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/gi,
+        activeAlias,
+        cteNames,
       );
 
-    return qualified;
+      return updated;
+    });
+  }
+
+  private qualifyKeywordTarget(
+    sqlCode: string,
+    pattern: RegExp,
+    activeAlias: string,
+    cteNames: ReadonlySet<string>,
+  ): string {
+    return sqlCode.replace(pattern, (match, prefix: string, identifier: string, offset: number) => {
+      const identifierStart = offset + prefix.length;
+      const identifierEnd = identifierStart + identifier.length;
+
+      if (this.isIdentifierAlreadyQualified(sqlCode, identifierEnd)) {
+        return match;
+      }
+
+      if (!this.shouldQualifyIdentifier(identifier, activeAlias, cteNames)) {
+        return match;
+      }
+
+      return `${prefix}${activeAlias}.${identifier}`;
+    });
+  }
+
+  private shouldQualifyIdentifier(
+    identifierToken: string,
+    activeAlias: string,
+    cteNames: ReadonlySet<string>,
+  ): boolean {
+    const normalized = this.normalizeIdentifierToken(identifierToken);
+
+    if (!normalized) {
+      return false;
+    }
+
+    if (normalized.toLowerCase() === activeAlias.toLowerCase()) {
+      return false;
+    }
+
+    if (cteNames.has(normalized.toLowerCase())) {
+      return false;
+    }
+
+    if (
+      normalized.toLowerCase() === 'sqlite_master' ||
+      normalized.toLowerCase() === 'sqlite_schema'
+    ) {
+      return true;
+    }
+
+    const upper = normalized.toUpperCase();
+
+    // Keywords are not table identifiers and should never be schema-qualified.
+    if (
+      upper === 'SELECT' ||
+      upper === 'VALUES' ||
+      upper === 'WHERE' ||
+      upper === 'GROUP' ||
+      upper === 'ORDER' ||
+      upper === 'LIMIT' ||
+      upper === 'OFFSET' ||
+      upper === 'JOIN' ||
+      upper === 'INNER' ||
+      upper === 'LEFT' ||
+      upper === 'RIGHT' ||
+      upper === 'FULL' ||
+      upper === 'CROSS' ||
+      upper === 'UNION' ||
+      upper === 'EXCEPT' ||
+      upper === 'INTERSECT' ||
+      upper === 'ON' ||
+      upper === 'USING' ||
+      upper === 'AS'
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private extractCteNames(sqlCode: string): Set<string> {
+    const names = new Set<string>();
+    const withPattern = /\bWITH\b/gi;
+    let withMatch: RegExpExecArray | null;
+
+    while ((withMatch = withPattern.exec(sqlCode)) !== null) {
+      let cursor = withMatch.index + withMatch[0].length;
+
+      while (cursor < sqlCode.length) {
+        const identifierMatch = sqlCode
+          .slice(cursor)
+          .match(/^\s*(\[[^\]]+\]|"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)/);
+
+        if (!identifierMatch) {
+          break;
+        }
+
+        const identifierToken = identifierMatch[1];
+        const normalizedIdentifier = this.normalizeIdentifierToken(identifierToken);
+
+        if (!normalizedIdentifier) {
+          break;
+        }
+
+        names.add(normalizedIdentifier.toLowerCase());
+        cursor += identifierMatch[0].length;
+
+        const columnListMatch = sqlCode.slice(cursor).match(/^\s*\([^)]*\)/);
+
+        if (columnListMatch) {
+          cursor += columnListMatch[0].length;
+        }
+
+        const asMatch = sqlCode.slice(cursor).match(/^\s+AS\s*\(/i);
+
+        if (!asMatch) {
+          names.delete(normalizedIdentifier.toLowerCase());
+          break;
+        }
+
+        cursor += asMatch[0].length;
+        let depth = 1;
+
+        while (cursor < sqlCode.length && depth > 0) {
+          const character = sqlCode[cursor];
+
+          if (character === '(') {
+            depth += 1;
+          } else if (character === ')') {
+            depth -= 1;
+          }
+
+          cursor += 1;
+        }
+
+        if (depth !== 0) {
+          break;
+        }
+
+        const commaMatch = sqlCode.slice(cursor).match(/^\s*,/);
+
+        if (commaMatch) {
+          cursor += commaMatch[0].length;
+          continue;
+        }
+
+        break;
+      }
+    }
+
+    return names;
+  }
+
+  private normalizeIdentifierToken(token: string): string | null {
+    const trimmed = token.trim();
+
+    if (/^\[[^\]]+\]$/.test(trimmed)) {
+      return trimmed.slice(1, -1).replace(/\]\]/g, ']');
+    }
+
+    if (/^"[^"]+"$/.test(trimmed)) {
+      return trimmed.slice(1, -1).replace(/""/g, '"');
+    }
+
+    if (/^`[^`]+`$/.test(trimmed)) {
+      return trimmed.slice(1, -1).replace(/``/g, '`');
+    }
+
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    return null;
+  }
+
+  private isIdentifierAlreadyQualified(
+    sqlCode: string,
+    identifierEnd: number,
+  ): boolean {
+    let cursor = identifierEnd;
+
+    while (cursor < sqlCode.length && /\s/.test(sqlCode[cursor])) {
+      cursor += 1;
+    }
+
+    return sqlCode[cursor] === '.';
   }
 
   private resetBufferAndPrompt(): void {

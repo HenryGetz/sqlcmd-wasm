@@ -1,0 +1,24 @@
+{
+  "name": "sqlcmd-wasm",
+  "short_name": "sqlcmd",
+  "description": "SQL Server-flavored sqlcmd emulator running fully in-browser via WASM.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#0C0C0C",
+  "theme_color": "#0C0C0C",
+  "icons": [
+    {
+      "src": "./pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

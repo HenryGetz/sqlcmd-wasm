@@ -3,6 +3,7 @@ import initSqlJs, { type Database, type SqlJsStatic, type Statement } from 'sql.
 import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
 
 import type { BatchExecutionResult, QueryResultSet } from './types';
+import { mapSqlCodeSegments } from './sqlTextUtils';
 
 interface SingleRunSuccess {
   ok: true;
@@ -368,21 +369,37 @@ export class ExecutionEngine {
    * Patch known transpiler output forms that SQLite cannot execute directly.
    */
   private normalizeTranspiledSqliteStatement(statement: string): string {
-    return statement
-      .replace(/\bAUTOINCREMENT\s+START\s+\d+\s+INCREMENT\s+\d+\b/gi, 'AUTOINCREMENT')
-      .replace(
-        /(\b[A-Za-z]+(?:\([^)]*\))?)\s+FOREIGN\s+KEY\s+REFERENCES\b/gi,
-        '$1 REFERENCES',
-      )
-      // T-SQL runtime function aliases that often survive transpilation.
-      .replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_TIMESTAMP')
-      .replace(/\bISNULL\s*\(/gi, 'IFNULL(')
-      .replace(/\bLEN\s*\(/gi, 'LENGTH(')
-      .replace(/\bYEAR\s*\(\s*([^()]+?)\s*\)/gi, "CAST(strftime('%Y', $1) AS INTEGER)")
-      .replace(/\bMONTH\s*\(\s*([^()]+?)\s*\)/gi, "CAST(strftime('%m', $1) AS INTEGER)")
-      .replace(/\bDAY\s*\(\s*([^()]+?)\s*\)/gi, "CAST(strftime('%d', $1) AS INTEGER)")
-      // Preserve numeric '+' semantics by only rewriting obviously string-oriented
-      // concatenation shapes that appear in transpiled output.
+    const tokenNormalized = mapSqlCodeSegments(statement, (code) => {
+      return code
+        .replace(
+          /\bAUTOINCREMENT\s+START\s+\d+\s+INCREMENT\s+\d+\b/gi,
+          'AUTOINCREMENT',
+        )
+        .replace(
+          /(\b[A-Za-z]+(?:\([^)]*\))?)\s+FOREIGN\s+KEY\s+REFERENCES\b/gi,
+          '$1 REFERENCES',
+        )
+        // T-SQL runtime function aliases that often survive transpilation.
+        .replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_TIMESTAMP')
+        .replace(/\bISNULL\s*\(/gi, 'IFNULL(')
+        .replace(/\bLEN\s*\(/gi, 'LENGTH(')
+        .replace(
+          /\bYEAR\s*\(\s*([^()]+?)\s*\)/gi,
+          "CAST(strftime('%Y', $1) AS INTEGER)",
+        )
+        .replace(
+          /\bMONTH\s*\(\s*([^()]+?)\s*\)/gi,
+          "CAST(strftime('%m', $1) AS INTEGER)",
+        )
+        .replace(
+          /\bDAY\s*\(\s*([^()]+?)\s*\)/gi,
+          "CAST(strftime('%d', $1) AS INTEGER)",
+        );
+    });
+
+    // Preserve numeric '+' semantics by only rewriting obviously string-oriented
+    // concatenation shapes that appear in transpiled output.
+    return tokenNormalized
       .replace(
         /('(?:''|[^'])*')(\s*)\+(\s*)(?=(?:CAST\b|IFNULL\b|COALESCE\b|CONCAT\b|[A-Za-z_]|\(|'|"|`|\[))/gi,
         (match, literal, leftSpace, rightSpace) => {

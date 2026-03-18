@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import wasm from 'vite-plugin-wasm';
+import fs from 'node:fs';
 import path from 'node:path';
 
 export default defineConfig(() => {
@@ -11,9 +12,22 @@ export default defineConfig(() => {
   const base =
     explicitBase ?? (isGithubActionsBuild && repositoryName ? `/${repositoryName}/` : '/');
 
+  const localPolyglotEntry = path.resolve(
+    process.cwd(),
+    '../polyglot/packages/sdk/dist/index.js',
+  );
+  const useLocalPolyglot = fs.existsSync(localPolyglotEntry);
+
   return {
     base,
     plugins: [wasm()],
+    resolve: {
+      alias: useLocalPolyglot
+        ? {
+            '@polyglot-sql/sdk': localPolyglotEntry,
+          }
+        : undefined,
+    },
     server: {
       fs: {
         // Allow local linked polyglot SDK files (including its WASM) in dev.

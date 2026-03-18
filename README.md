@@ -51,13 +51,33 @@ npm run build
 npm run preview
 ```
 
+## PWA / Offline Mode
+
+This app is now configured as a Progressive Web App (PWA):
+
+- First online load caches the shell + WASM/assets via a service worker.
+- After that, it can launch and run offline.
+- While online, it periodically checks for updates and refreshes cached assets.
+- Updated assets are used on the next reload/open.
+
+For local verification:
+
+```bash
+npm run build
+npm run preview
+```
+
+Then open the preview URL once while online. You can optionally install it from the browser as an app.
+
 ## Local Polyglot SDK
 
-This workspace is currently pinned to a local SDK checkout:
+By default this app uses the published `@polyglot-sql/sdk` package.
 
-- `@polyglot-sql/sdk` -> `file:../polyglot/packages/sdk`
+When a local polyglot checkout exists at `../polyglot/packages/sdk/dist/index.js`,
+the Vite config automatically aliases `@polyglot-sql/sdk` to that local build.
 
-That means transpilation changes in `/home/wavy/ai/polyglot/packages/sdk` can be exercised directly in this app.
+That lets transpilation changes in `/home/wavy/ai/polyglot/packages/sdk` be exercised directly in this app,
+while keeping a resolvable dependency graph for normal checkouts/CI.
 
 ## Headless CLI Testing
 

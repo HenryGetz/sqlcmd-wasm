@@ -11,9 +11,14 @@ export class TerminalUI {
 
   private currentInput = '';
   private lineHandler: ((line: string) => void | Promise<void>) | null = null;
+  private currentPromptText = '';
+
+  private readonly commandHistory: string[] = [];
+  private historyCursor: number | null = null;
+  private historyDraft = '';
 
   private previousInputEndedWithCarriageReturn = false;
-  private isConsumingAnsiEscapeSequence = false;
+  private pendingEscapeSequence = '';
 
   private isPermanentlyLocked = false;
   private isTemporarilyDisabled = false;
@@ -86,7 +91,8 @@ export class TerminalUI {
    */
   public renderPrompt(promptNumber: number): void {
     // Use write() (not writeln()) so the cursor stays on the prompt line.
-    this.terminal.write(`${promptNumber}> `);
+    this.currentPromptText = `${promptNumber}> `;
+    this.terminal.write(this.currentPromptText);
   }
 
   /**
@@ -175,17 +181,27 @@ export class TerminalUI {
       return;
     }
 
-    for (const char of chunk) {
-      if (this.isConsumingAnsiEscapeSequence) {
-        if (this.isAnsiEscapeTerminator(char)) {
-          this.isConsumingAnsiEscapeSequence = false;
+    const data = this.pendingEscapeSequence + chunk;
+    let index = 0;
+
+    while (index < data.length) {
+      const char = data[index];
+
+      if (char === '\u001b') {
+        const sequenceResult = this.consumeEscapeSequence(data, index);
+
+        if (sequenceResult.kind === 'incomplete') {
+          this.pendingEscapeSequence = data.slice(index);
+          return;
         }
 
+        index = sequenceResult.nextIndex;
         continue;
       }
 
       if (char === '\n' && this.previousInputEndedWithCarriageReturn) {
         this.previousInputEndedWithCarriageReturn = false;
+        index += 1;
         continue;
       }
 
@@ -197,11 +213,13 @@ export class TerminalUI {
         }
 
         this.submitCurrentLine();
+        index += 1;
         continue;
       }
 
       if (char === '\u007f') {
         this.handleBackspace();
+        index += 1;
         continue;
       }
 
@@ -209,12 +227,9 @@ export class TerminalUI {
         // Ctrl+C clears the current line but keeps the session alive.
         this.terminal.write('^C\r\n');
         this.currentInput = '';
-        continue;
-      }
-
-      if (char === '\u001b') {
-        // Consume ANSI escape/control sequences (arrow keys, etc.).
-        this.isConsumingAnsiEscapeSequence = true;
+        this.historyCursor = null;
+        this.historyDraft = '';
+        index += 1;
         continue;
       }
 
@@ -222,13 +237,27 @@ export class TerminalUI {
         this.currentInput += char;
         this.terminal.write(char);
       }
+
+      index += 1;
     }
+
+    this.pendingEscapeSequence = '';
   }
 
   private submitCurrentLine(): void {
     this.terminal.write('\r\n');
     const submittedLine = this.currentInput;
     this.currentInput = '';
+    this.historyCursor = null;
+    this.historyDraft = '';
+
+    if (submittedLine.trim().length > 0) {
+      const previous = this.commandHistory[this.commandHistory.length - 1];
+
+      if (previous !== submittedLine) {
+        this.commandHistory.push(submittedLine);
+      }
+    }
 
     if (this.lineHandler) {
       void this.lineHandler(submittedLine);
@@ -242,6 +271,87 @@ export class TerminalUI {
 
     this.currentInput = this.currentInput.slice(0, -1);
     this.terminal.write('\b \b');
+  }
+
+  private consumeEscapeSequence(
+    data: string,
+    startIndex: number,
+  ): { kind: 'complete'; nextIndex: number } | { kind: 'incomplete' } {
+    if (startIndex + 1 >= data.length) {
+      return { kind: 'incomplete' };
+    }
+
+    const next = data[startIndex + 1];
+
+    // Non-CSI escape sequences are ignored.
+    if (next !== '[') {
+      return {
+        kind: 'complete',
+        nextIndex: startIndex + 2,
+      };
+    }
+
+    let cursor = startIndex + 2;
+
+    while (cursor < data.length) {
+      const token = data[cursor];
+
+      if (!this.isAnsiEscapeTerminator(token)) {
+        cursor += 1;
+        continue;
+      }
+
+      if (token === 'A') {
+        this.handleHistoryUp();
+      } else if (token === 'B') {
+        this.handleHistoryDown();
+      }
+
+      return {
+        kind: 'complete',
+        nextIndex: cursor + 1,
+      };
+    }
+
+    return { kind: 'incomplete' };
+  }
+
+  private handleHistoryUp(): void {
+    if (this.commandHistory.length === 0) {
+      return;
+    }
+
+    if (this.historyCursor === null) {
+      this.historyDraft = this.currentInput;
+      this.historyCursor = this.commandHistory.length - 1;
+    } else if (this.historyCursor > 0) {
+      this.historyCursor -= 1;
+    }
+
+    this.currentInput = this.commandHistory[this.historyCursor];
+    this.redrawCurrentInputLine();
+  }
+
+  private handleHistoryDown(): void {
+    if (this.historyCursor === null) {
+      return;
+    }
+
+    if (this.historyCursor < this.commandHistory.length - 1) {
+      this.historyCursor += 1;
+      this.currentInput = this.commandHistory[this.historyCursor];
+    } else {
+      this.historyCursor = null;
+      this.currentInput = this.historyDraft;
+      this.historyDraft = '';
+    }
+
+    this.redrawCurrentInputLine();
+  }
+
+  private redrawCurrentInputLine(): void {
+    this.terminal.write('\x1b[2K\r');
+    this.terminal.write(`${this.currentPromptText}${this.currentInput}`);
   }
 
   private isPrintable(char: string): boolean {
